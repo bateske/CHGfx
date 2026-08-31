@@ -1,0 +1,118 @@
+#######################################
+# Syntax Coloring Map for CHGfx
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+CHGfx	KEYWORD1
+CHGfx_GFX	KEYWORD1
+Gfx	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+# Class API
+begin	KEYWORD2
+display	KEYWORD2
+displayAsync	KEYWORD2
+displayRect	KEYWORD2
+displayRectAsync	KEYWORD2
+busy	KEYWORD2
+wait	KEYWORD2
+clear	KEYWORD2
+drawPixel	KEYWORD2
+getPixel	KEYWORD2
+drawFastHLine	KEYWORD2
+drawFastVLine	KEYWORD2
+fillRect	KEYWORD2
+drawRect	KEYWORD2
+drawLine	KEYWORD2
+drawCircle	KEYWORD2
+fillCircle	KEYWORD2
+drawSprite	KEYWORD2
+drawChar	KEYWORD2
+setPalette	KEYWORD2
+setPaletteEntry	KEYWORD2
+nearest	KEYWORD2
+rgb	KEYWORD2
+setSpiDiv	KEYWORD2
+setColorMode	KEYWORD2
+colorMode	KEYWORD2
+spiHz	KEYWORD2
+setPanelOffsets	KEYWORD2
+setPanelFrameRate	KEYWORD2
+setInverted	KEYWORD2
+fillRectDirect	KEYWORD2
+buffer	KEYWORD2
+
+# Free-function API
+gfx_begin	KEYWORD2
+gfx_flush	KEYWORD2
+gfx_flushAsync	KEYWORD2
+gfx_flushRect	KEYWORD2
+gfx_flushRectAsync	KEYWORD2
+gfx_busy	KEYWORD2
+gfx_wait	KEYWORD2
+gfx_clear	KEYWORD2
+gfx_pixel	KEYWORD2
+gfx_getPixel	KEYWORD2
+gfx_hline	KEYWORD2
+gfx_vline	KEYWORD2
+gfx_fillRect	KEYWORD2
+gfx_rect	KEYWORD2
+gfx_line	KEYWORD2
+gfx_circle	KEYWORD2
+gfx_fillCircle	KEYWORD2
+gfx_blit	KEYWORD2
+gfx_char	KEYWORD2
+gfx_text	KEYWORD2
+gfx_textScaled	KEYWORD2
+gfx_setPalette	KEYWORD2
+gfx_setPaletteEntry	KEYWORD2
+gfx_nearest	KEYWORD2
+gfx_rgb	KEYWORD2
+gfx_setSpiDiv	KEYWORD2
+gfx_setColorMode	KEYWORD2
+gfx_colorMode	KEYWORD2
+gfx_spiHz	KEYWORD2
+gfx_spiDiv	KEYWORD2
+gfx_frameBytes	KEYWORD2
+gfx_setPanelOffsets	KEYWORD2
+gfx_setPanelFrameRate	KEYWORD2
+gfx_setInverted	KEYWORD2
+gfx_setWindow	KEYWORD2
+gfx_select	KEYWORD2
+gfx_deselect	KEYWORD2
+gfx_cmd	KEYWORD2
+gfx_data8	KEYWORD2
+gfx_directFillRect	KEYWORD2
+gfx_directBlit	KEYWORD2
+gfx_blockingWrite	KEYWORD2
+gfx_writeColorLut	KEYWORD2
+gfx_setWriteColorLut	KEYWORD2
+gfx_convertRows_ram	KEYWORD2
+gfx_convertRows_flash	KEYWORD2
+gfx_convertSpan_ram	KEYWORD2
+gfx_chunkScratch	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+GFX_W	LITERAL1
+GFX_H	LITERAL1
+GFX_FB_BYTES	LITERAL1
+GFX_FB_STRIDE	LITERAL1
+GFX_CHUNK_ROWS	LITERAL1
+GFX_CHUNK_BYTES	LITERAL1
+GFX_16BPP	LITERAL1
+GFX_12BPP	LITERAL1
+GFX_DIV2	LITERAL1
+GFX_DIV4	LITERAL1
+GFX_DIV8	LITERAL1
+GFX_DIV16	LITERAL1
+gfx_fb	LITERAL1
+gfx_pal	LITERAL1
