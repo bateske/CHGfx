@@ -173,6 +173,44 @@ path.** Worth designing your art around: it is measurably the fastest
 case, and transparent blits were the single largest CPU cost in a real
 game frame.
 
+## Text and fonts
+
+The built-in 5×7 font costs 475 bytes and needs no setup. For anything
+larger or proportional, `setFont()` takes a **GFXfont** — the
+Adafruit_GFX bitmap font format, unchanged:
+
+```cpp
+#include <fonts/CHGfx_SansBold16.h>
+
+Gfx.setFont(&CHGfx_SansBold16);
+Gfx.print(4, 20, "GAME OVER", RED);
+Gfx.setFont();                     // back to the built-in 5x7
+```
+
+Five fonts ship in `src/fonts/` — `Mono11`, `Sans12`, `SansBold12`,
+`SansBold16` and a digits-only `Digits24` for scores — costing 523 B to
+1866 B each, and only the ones you `#include` are linked.
+
+The format is byte-for-byte Adafruit’s, so fonts move both ways with no
+conversion: `Gfx.setFont(&FreeSans9pt7b)` works, and CHGfx’s fonts work
+under Adafruit_GFX’s own `setFont()`. `extras/fontconvert.py` turns any
+TTF into a new one.
+
+**The origin changes with the font.** Built-in font: `y` is the top of
+the glyph box. Custom font: `y` is the *baseline*. That is Adafruit’s
+convention and matching it is what makes the fonts interchangeable.
+`Gfx.fontBaseline()` converts — it returns 0 for the built-in font and
+the ascent for a custom one, so this always means “top of the text at
+`y`”:
+
+```cpp
+Gfx.print(x, y + Gfx.fontBaseline(), s, c);
+```
+
+`textWidth()`, `fontLineHeight()` and `textBounds()` are there for
+centring, right-alignment and boxing. Full details, the metrics table and
+the converter’s options are in [FONTS.md](FONTS.md).
+
 ## Already using Adafruit_GFX?
 
 Adafruit_GFX is not what's slow — `Adafruit_ST7735` underneath it is.
@@ -219,6 +257,7 @@ Two gotchas:
 | `AdafruitGFXCompat` | Keeping your Adafruit_GFX code, swapping the transport |
 | `Benchmark` | The full 12-test suite; prints to USB CDC and the panel |
 | `Demoscene` | Eight-part demo: plasma, tunnel, rotozoomer, fire, 3D, copper bars |
+| `Fonts` | Custom bitmap fonts, the baseline convention, aligned HUD text |
 
 ## Configuration
 
@@ -296,7 +335,10 @@ Class methods (on `Gfx`) and the equivalent free functions:
 | `drawLine()` | `gfx_line` |
 | `drawCircle()` / `fillCircle()` | `gfx_circle` / `gfx_fillCircle` |
 | `drawSprite()` | `gfx_blit` |
-| `drawChar()` / `print()` | `gfx_char` / `gfx_text` / `gfx_textScaled` |
+| `drawChar()` / `print()` | `gfx_char` / `gfx_charScaled` / `gfx_text` / `gfx_textScaled` |
+| `setFont()` / `font()` | `gfx_setFont` / `gfx_font` |
+| `fontLineHeight()` / `fontBaseline()` | `gfx_fontLineHeight` / `gfx_fontBaseline` |
+| `textWidth()` / `textBounds()` | `gfx_textWidth` / `gfx_textWidthScaled` / `gfx_textBounds` |
 | `setPalette()` / `nearest()` | `gfx_setPalette` / `gfx_nearest` |
 | `setColorMode()` / `setSpiDiv()` | `gfx_setColorMode` / `gfx_setSpiDiv` |
 | `fillRectDirect()` | `gfx_directFillRect` |
@@ -330,5 +372,7 @@ with no FPU, no cache and no blitter.
 
 ## Licence
 
-MIT, except the 5×7 font glyphs, which come from Adafruit's `glcdfont.c`
-under BSD. See [LICENSE](LICENSE).
+MIT, except the font data. The 5×7 glyphs come from Adafruit’s
+`glcdfont.c` under BSD, as does the `GFXfont` struct layout; the fonts in
+`src/fonts/` are rasterized from DejaVu Sans, which is freely
+redistributable. Full notices in [LICENSE](LICENSE).

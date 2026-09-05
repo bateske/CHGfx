@@ -41,6 +41,19 @@
  * at every call. It makes old code work verbatim but costs a 16-entry
  * search per drawing call, so it is off by default.
  *
+ * FONTS
+ * -----
+ * Adafruit_GFX's own setFont() keeps working here, and CHGfx's bundled
+ * fonts are GFXfonts, so they go straight in:
+ *
+ *     #include <fonts/CHGfx_Sans12.h>
+ *     tft.setFont(&CHGfx_Sans12);
+ *
+ * Note that tft.setFont() and Gfx.setFont() are SEPARATE state. The
+ * bridge routes drawing through Adafruit_GFX, which does its own glyph
+ * walking, so a font set on `Gfx` does not affect `tft` and vice versa.
+ * Pick one text path per sketch.
+ *
  * REQUIRES the Adafruit GFX Library to be installed. This header is not
  * included by CHGfx.h - include it yourself only if you want the bridge.
  *

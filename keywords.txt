@@ -8,6 +8,8 @@
 
 CHGfx	KEYWORD1
 CHGfx_GFX	KEYWORD1
+GFXfont	KEYWORD1
+GFXglyph	KEYWORD1
 Gfx	KEYWORD1
 
 #######################################
@@ -34,6 +36,12 @@ drawCircle	KEYWORD2
 fillCircle	KEYWORD2
 drawSprite	KEYWORD2
 drawChar	KEYWORD2
+setFont	KEYWORD2
+font	KEYWORD2
+fontLineHeight	KEYWORD2
+fontBaseline	KEYWORD2
+textWidth	KEYWORD2
+textBounds	KEYWORD2
 setPalette	KEYWORD2
 setPaletteEntry	KEYWORD2
 nearest	KEYWORD2
@@ -70,6 +78,14 @@ gfx_blit	KEYWORD2
 gfx_char	KEYWORD2
 gfx_text	KEYWORD2
 gfx_textScaled	KEYWORD2
+gfx_charScaled	KEYWORD2
+gfx_setFont	KEYWORD2
+gfx_font	KEYWORD2
+gfx_fontLineHeight	KEYWORD2
+gfx_fontBaseline	KEYWORD2
+gfx_textWidth	KEYWORD2
+gfx_textWidthScaled	KEYWORD2
+gfx_textBounds	KEYWORD2
 gfx_setPalette	KEYWORD2
 gfx_setPaletteEntry	KEYWORD2
 gfx_nearest	KEYWORD2
@@ -116,3 +132,8 @@ GFX_DIV8	LITERAL1
 GFX_DIV16	LITERAL1
 gfx_fb	LITERAL1
 gfx_pal	LITERAL1
+CHGfx_Mono11	LITERAL1
+CHGfx_Sans12	LITERAL1
+CHGfx_SansBold12	LITERAL1
+CHGfx_SansBold16	LITERAL1
+CHGfx_Digits24	LITERAL1

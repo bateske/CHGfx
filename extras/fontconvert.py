@@ -147,9 +147,23 @@ def main():
     w(" *")
     w(" * Source: %s at %d px" % (src, a.size))
     w(" * Range:  0x%02X..0x%02X (%d glyphs)" % (first, last, last - first + 1))
-    w(" * Size:   %d bytes bitmap + %d bytes glyph table + %d struct = %d bytes flash"
-      % (len(bitmap), (last - first + 1) * 7, 10, len(bitmap) + (last - first + 1) * 7 + 10))
-    w(" * Line:   %d px baseline-to-baseline, %d px ascent" % (y_advance, ascent))
+    # GFXglyph is 7 bytes of fields but 2-byte aligned, so it occupies 8;
+    # GFXfont is 13 bytes of fields, 4-byte aligned, so it occupies 16.
+    # Measured against real link output, not guessed.
+    n_glyphs = last - first + 1
+    w(" * Size:   %d B bitmap + %d B glyph table + 16 B struct = %d bytes of flash"
+      % (len(bitmap), n_glyphs * 8, len(bitmap) + n_glyphs * 8 + 16))
+    # Report the INK ascent/descent - the extreme of the actual glyph
+    # bitmaps - because that is what gfx_fontBaseline() returns and what
+    # you need to lay text out. FreeType's own ascent metric is larger:
+    # it reserves room for diacritics no glyph in this range uses.
+    inked = [g for g in glyphs if g[3]]
+    ink_asc = max((-g[6] for g in inked), default=0)
+    ink_desc = max((g[6] + g[3] for g in inked), default=0)
+    w(" * Line:   %d px baseline-to-baseline; ink is %d px above the baseline"
+      % (y_advance, ink_asc))
+    w(" *         and %d px below - gfx_fontBaseline() returns %d."
+      % (ink_desc, ink_asc))
     if a.note:
         w(" *")
         for line in a.note.split("\n"):

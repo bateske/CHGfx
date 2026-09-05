@@ -3,8 +3,9 @@
  *
  * Source: DejaVuSans-Bold.ttf at 24 px
  * Range:  0x2B..0x3A (16 glyphs)
- * Size:   379 bytes bitmap + 112 bytes glyph table + 10 struct = 501 bytes flash
- * Line:   29 px baseline-to-baseline, 23 px ascent
+ * Size:   379 B bitmap + 128 B glyph table + 16 B struct = 523 bytes of flash
+ * Line:   29 px baseline-to-baseline; ink is 18 px above the baseline
+ *         and 3 px below - gfx_fontBaseline() returns 18.
  *
  * Rasterized from DejaVu Sans, (c) 2003 Bitstream Inc. and (c) Bitstream Vera
  * fonts copyright, with DejaVu changes in the public domain. Free to use and

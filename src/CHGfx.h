@@ -318,8 +318,11 @@ void gfx_textScaled(int x, int y, const char *s, uint8_t c, uint8_t scale);
 int gfx_textWidth(const char *s);
 int gfx_textWidthScaled(const char *s, uint8_t scale);
 
-/* Tight ink box of a string drawn at (x, y), same units and origin
- * convention as gfx_text. Any of the four outputs may be nullptr. */
+/* Bounding box of a string drawn at (x, y), same units and origin
+ * convention as gfx_text - use it to frame or erase text without
+ * guessing. With a custom font this is the tight ink box; with the
+ * built-in font it is the 5x7 cell box, so a leading space still counts.
+ * Any of the four outputs may be nullptr. */
 void gfx_textBounds(const char *s, int x, int y, uint8_t scale,
                     int *bx, int *by, int *bw, int *bh);
 
