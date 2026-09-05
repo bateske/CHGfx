@@ -243,6 +243,26 @@ Panel geometry defaults match Adafruit's `INITR_144GREENTAB` (MADCTL
 Gfx.setPanelOffsets(0xC8, 2, 3);
 ```
 
+### A note about GPIOB pins 8–15
+
+The CH32X035's `CFGHR` register — the pin config for PB8…PB15, which on
+this board is the buttons, the LED, the buzzer, SD_CS and LCD_RST — is
+**write-only**. Reading it back does not return what was written, so the
+vendor GPIO driver keeps a RAM shadow (`CFGHR_tmpB`) and rebuilds the
+whole register from it on every `pinMode()`.
+
+CHGfx writes through that same shadow, so its pin config and the core's
+compose in either order. If you configure pins in that range with raw
+register writes of your own, do the same — a read-modify-write of
+`CFGHR` will silently reconfigure every other pin in the register.
+
+Getting this wrong on LCD_RST specifically is nasty: the pin reverts to
+an input, `LCD_RST` runs straight from the MCU to the panel with no
+pull-up on the net, and after about a second idle the floating line
+drifts low. The ST7735 reads that as a reset pulse and blanks to white
+while the CPU keeps streaming frames, unaware. CHGfx re-asserts RST as a
+driven-high output on every `setWindow()` as a backstop.
+
 ## A caution about the SPI clock
 
 The default is HCLK/2 = **24 MHz**. The ST7735S datasheet specifies

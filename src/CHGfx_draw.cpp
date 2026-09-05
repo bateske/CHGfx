@@ -253,13 +253,68 @@ RAMFUNC void gfx_blit(const uint8_t *spr, int x, int y, int w, int h, int transp
 /* Text                                                                */
 /* ------------------------------------------------------------------ */
 /*
- * Glyphs walk the framebuffer directly. The obvious version calls
- * gfx_pixel per lit pixel, which is a flash-resident call plus a full
- * clip test 20-odd times per character - that measured 40 us/char.
- * Here the column pointer and the nibble shift are hoisted out and only
- * the row stride is added per pixel.
+ * Two font systems live here.
+ *
+ *   * The built-in 5x7, one byte per COLUMN, bit 0 = top. It is 475
+ *     bytes and needs no setup, so it stays the default.
+ *   * GFXfont, the Adafruit format: proportional, arbitrary height, a
+ *     row-major MSB-first bitstream per glyph. Selected with
+ *     gfx_setFont() and used by every text call from then on.
+ *
+ * ORIGIN, and this is the one thing that trips people up: the built-in
+ * font draws with y as the TOP of the glyph box, a GFXfont draws with y
+ * as the BASELINE. That is not a CHGfx invention - it is exactly what
+ * Adafruit_GFX does, so sketches and font data port over unchanged. If
+ * you want to keep thinking in top-left coordinates, add
+ * gfx_fontBaseline(), which is 0 for the built-in font and the ascent
+ * for a custom one:
+ *
+ *     gfx_text(x, y + gfx_fontBaseline(), "aligned to y", c);
  */
-RAMFUNC void gfx_char(int x, int y, char ch, uint8_t c) {
+
+static const GFXfont *s_font   = nullptr;
+static int16_t        s_ascent = 0;   /* rows above the baseline, cached */
+
+void gfx_setFont(const GFXfont *f) {
+    s_font = f;
+    s_ascent = 0;
+    if (!f) return;
+
+    /* The struct records no ascent, so derive it once here rather than
+     * per call: the topmost ink of any glyph is the most negative
+     * yOffset. 95 glyphs is a few microseconds at setup time. */
+    int n = (int)f->last - (int)f->first + 1;
+    int minYo = 0;
+    for (int i = 0; i < n; i++) {
+        if (!f->glyph[i].height) continue;          /* space, blanks */
+        if (f->glyph[i].yOffset < minYo) minYo = f->glyph[i].yOffset;
+    }
+    s_ascent = (int16_t)(-minYo);
+}
+
+const GFXfont *gfx_font(void)   { return s_font; }
+int gfx_fontLineHeight(void)    { return s_font ? (int)s_font->yAdvance : 8; }
+int gfx_fontBaseline(void)      { return s_font ? (int)s_ascent : 0; }
+
+/* Characters outside the font's range fall back to '?', and if the font
+ * has no '?' either - a digits-only font, say - they are dropped, which
+ * is what Adafruit_GFX does. */
+static const GFXglyph *glyphFor(const GFXfont *f, unsigned char ch) {
+    if (ch < f->first || ch > f->last) {
+        if ('?' < f->first || '?' > f->last) return nullptr;
+        ch = '?';
+    }
+    return &f->glyph[ch - f->first];
+}
+
+/*
+ * Built-in font, scale 1. The obvious version calls gfx_pixel per lit
+ * pixel, which is a flash-resident call plus a full clip test 20-odd
+ * times per character - that measured 40 us/char. Here the column
+ * pointer and the nibble shift are hoisted out and only the row stride
+ * is added per pixel.
+ */
+RAMFUNC static void charBuiltin(int x, int y, char ch, uint8_t c) {
     if (ch < 32 || ch > 126) ch = '?';
     const uint8_t *g = chgfx_font5x7 + (ch - 32) * 5;
     c &= 0x0F;
@@ -292,22 +347,215 @@ RAMFUNC void gfx_char(int x, int y, char ch, uint8_t c) {
     }
 }
 
-void gfx_text(int x, int y, const char *s, uint8_t c) {
-    while (*s) { gfx_char(x, y, *s++, c); x += 6; }
+static void charBuiltinScaled(int x, int y, char ch, uint8_t c, uint8_t scale) {
+    if (ch < 32 || ch > 126) ch = '?';
+    const uint8_t *g = chgfx_font5x7 + (ch - 32) * 5;
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = g[col];
+        for (int row = 0; row < 7; row++)
+            if (bits & (1u << row))
+                gfx_fillRect(x + col * scale, y + row * scale, scale, scale, c);
+    }
+}
+
+/*
+ * GFXfont glyph, scale 1.
+ *
+ * The bitstream is row-major and rows are not byte-aligned, so every bit
+ * has to be consumed in order even where the pixel is clipped away -
+ * hence the running (cur, nbits) accumulator rather than an index. The
+ * one shortcut that matters: an all-zero byte skips up to eight columns
+ * in a single step, and in a typical glyph most bytes are mostly zero.
+ */
+RAMFUNC static void drawGlyph1(const uint8_t *bmp, const GFXglyph *g,
+                               int x, int y, uint8_t c)
+{
+    int gw = g->width, gh = g->height;
+    if (!gw || !gh) return;
+
+    const uint8_t *p = bmp + g->bitmapOffset;
+    int gx = x + g->xOffset;
+    int gy = y + g->yOffset;
+    c &= 0x0F;
+    uint8_t lo = c, hi = (uint8_t)(c << 4);
+
+    uint32_t cur = 0;
+    int nbits = 0;
+
+    for (int r = 0; r < gh; r++) {
+        int py = gy + r;
+        uint8_t *rp = ((unsigned)py < (unsigned)GFX_H) ? rowPtr(py) : nullptr;
+        int col = 0;
+        while (col < gw) {
+            if (!nbits) { cur = *p++; nbits = 8; }
+            if (!cur) {                       /* rest of this byte is blank */
+                int take = gw - col;
+                if (take > nbits) take = nbits;
+                col += take; nbits -= take;
+                continue;
+            }
+            if ((cur & 0x80) && rp) {
+                unsigned px = (unsigned)(gx + col);
+                if (px < (unsigned)GFX_W) {
+                    uint8_t *q = rp + (px >> 1);
+                    if (px & 1) *q = (uint8_t)((*q & 0x0F) | hi);
+                    else        *q = (uint8_t)((*q & 0xF0) | lo);
+                }
+            }
+            cur = (cur << 1) & 0xFF;
+            nbits--; col++;
+        }
+    }
+}
+
+static void drawGlyphScaled(const uint8_t *bmp, const GFXglyph *g,
+                            int x, int y, uint8_t c, uint8_t scale)
+{
+    int gw = g->width, gh = g->height;
+    if (!gw || !gh) return;
+
+    const uint8_t *p = bmp + g->bitmapOffset;
+    int gx = x + g->xOffset * scale;
+    int gy = y + g->yOffset * scale;
+
+    uint32_t cur = 0;
+    int nbits = 0;
+
+    for (int r = 0; r < gh; r++) {
+        int col = 0;
+        while (col < gw) {
+            if (!nbits) { cur = *p++; nbits = 8; }
+            if (!cur) {
+                int take = gw - col;
+                if (take > nbits) take = nbits;
+                col += take; nbits -= take;
+                continue;
+            }
+            if (cur & 0x80)
+                gfx_fillRect(gx + col * scale, gy + r * scale, scale, scale, c);
+            cur = (cur << 1) & 0xFF;
+            nbits--; col++;
+        }
+    }
+}
+
+void gfx_charScaled(int x, int y, char ch, uint8_t c, uint8_t scale) {
+    if (scale < 1) scale = 1;
+    const GFXfont *f = s_font;
+    if (!f) {
+        if (scale == 1) charBuiltin(x, y, ch, c);
+        else            charBuiltinScaled(x, y, ch, c, scale);
+        return;
+    }
+    const GFXglyph *g = glyphFor(f, (unsigned char)ch);
+    if (!g) return;
+    if (scale == 1) drawGlyph1(f->bitmap, g, x, y, c);
+    else            drawGlyphScaled(f->bitmap, g, x, y, c, scale);
+}
+
+void gfx_char(int x, int y, char ch, uint8_t c) {
+    gfx_charScaled(x, y, ch, c, 1);
 }
 
 void gfx_textScaled(int x, int y, const char *s, uint8_t c, uint8_t scale) {
-    if (scale <= 1) { gfx_text(x, y, s, c); return; }
-    while (*s) {
-        char ch = *s++;
-        if (ch < 32 || ch > 126) ch = '?';
-        const uint8_t *g = chgfx_font5x7 + (ch - 32) * 5;
-        for (int col = 0; col < 5; col++) {
-            uint8_t bits = g[col];
-            for (int row = 0; row < 7; row++)
-                if (bits & (1u << row))
-                    gfx_fillRect(x + col * scale, y + row * scale, scale, scale, c);
+    if (scale < 1) scale = 1;
+    const GFXfont *f = s_font;
+    const int x0 = x;
+
+    if (!f) {
+        while (*s) {
+            char ch = *s++;
+            if (ch == '\n') { x = x0; y += 8 * scale; continue; }
+            if (ch == '\r') continue;
+            if (scale == 1) charBuiltin(x, y, ch, c);
+            else            charBuiltinScaled(x, y, ch, c, scale);
+            x += 6 * scale;
         }
-        x += 6 * scale;
+        return;
     }
+
+    while (*s) {
+        unsigned char ch = (unsigned char)*s++;
+        if (ch == '\n') { x = x0; y += f->yAdvance * scale; continue; }
+        if (ch == '\r') continue;
+        const GFXglyph *g = glyphFor(f, ch);
+        if (!g) continue;
+        if (scale == 1) drawGlyph1(f->bitmap, g, x, y, c);
+        else            drawGlyphScaled(f->bitmap, g, x, y, c, scale);
+        x += g->xAdvance * scale;
+    }
+}
+
+void gfx_text(int x, int y, const char *s, uint8_t c) {
+    gfx_textScaled(x, y, s, c, 1);
+}
+
+/* ------------------------------------------------------------------ */
+/* Text metrics                                                        */
+/* ------------------------------------------------------------------ */
+int gfx_textWidthScaled(const char *s, uint8_t scale) {
+    if (scale < 1) scale = 1;
+    const GFXfont *f = s_font;
+    int w = 0, widest = 0;
+    while (*s) {
+        unsigned char ch = (unsigned char)*s++;
+        if (ch == '\n') { if (w > widest) widest = w; w = 0; continue; }
+        if (ch == '\r') continue;
+        if (!f) {
+            w += 6 * scale;
+        } else {
+            const GFXglyph *g = glyphFor(f, ch);
+            if (g) w += g->xAdvance * scale;
+        }
+    }
+    return (w > widest) ? w : widest;
+}
+
+int gfx_textWidth(const char *s) { return gfx_textWidthScaled(s, 1); }
+
+void gfx_textBounds(const char *s, int x, int y, uint8_t scale,
+                    int *bx, int *by, int *bw, int *bh)
+{
+    if (scale < 1) scale = 1;
+    const GFXfont *f = s_font;
+    const int x0 = x;
+    int minx = 0x7FFF, miny = 0x7FFF, maxx = -0x8000, maxy = -0x8000;
+
+    while (*s) {
+        unsigned char ch = (unsigned char)*s++;
+        if (ch == '\n') {
+            x = x0;
+            y += (f ? f->yAdvance : 8) * scale;
+            continue;
+        }
+        if (ch == '\r') continue;
+
+        int gx0, gy0, gx1, gy1, adv;
+        if (!f) {
+            gx0 = x;             gy0 = y;
+            gx1 = x + 5 * scale - 1;
+            gy1 = y + 7 * scale - 1;
+            adv = 6 * scale;
+        } else {
+            const GFXglyph *g = glyphFor(f, ch);
+            if (!g) continue;
+            adv = g->xAdvance * scale;
+            if (!g->width || !g->height) { x += adv; continue; }
+            gx0 = x + g->xOffset * scale;
+            gy0 = y + g->yOffset * scale;
+            gx1 = gx0 + g->width  * scale - 1;
+            gy1 = gy0 + g->height * scale - 1;
+        }
+        if (gx0 < minx) minx = gx0;
+        if (gy0 < miny) miny = gy0;
+        if (gx1 > maxx) maxx = gx1;
+        if (gy1 > maxy) maxy = gy1;
+        x += adv;
+    }
+
+    if (maxx < minx) { minx = x0; miny = y; maxx = x0 - 1; maxy = y - 1; }
+    if (bx) *bx = minx;
+    if (by) *by = miny;
+    if (bw) *bw = maxx - minx + 1;
+    if (bh) *bh = maxy - miny + 1;
 }

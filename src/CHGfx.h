@@ -52,6 +52,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include "CHGfx_gfxfont.h"
 
 #if !defined(CH32X035)
   #error "CHGfx targets the CH32X035. It drives SPI1 and DMA1 channel 3 directly and is not portable as-is. Select a CH32X035 board."
@@ -266,10 +267,61 @@ void gfx_fillCircle(int cx, int cy, int r, uint8_t c);
  * (the opaque even-x case runs at memcpy speed). */
 void gfx_blit(const uint8_t *spr, int x, int y, int w, int h, int transparent);
 
-/* Built-in 5x7 font, 1 byte per column, ASCII 32..126. */
+/* ------------------------------------------------------------------ */
+/* Text                                                                */
+/* ------------------------------------------------------------------ */
+/*
+ * Default font is the built-in 5x7, ASCII 32..126, 475 bytes, no setup.
+ * gfx_setFont() swaps in a proportional GFXfont; gfx_setFont(nullptr)
+ * puts the built-in one back.
+ *
+ *     #include <fonts/CHGfx_Sans12.h>
+ *     Gfx.setFont(&CHGfx_Sans12);
+ *     Gfx.print(4, 20, "Hello", WHITE);
+ *
+ * GFXfont is byte-for-byte Adafruit's format (see CHGfx_gfxfont.h), so
+ * anything from Adafruit_GFX's Fonts/ directory, or produced by either
+ * font converter, works here as-is:
+ *
+ *     #include <Fonts/FreeSans9pt7b.h>
+ *     Gfx.setFont(&FreeSans9pt7b);
+ *
+ * THE ORIGIN CHANGES WITH THE FONT. Built-in font: y is the TOP of the
+ * glyph box. Custom font: y is the BASELINE, with ascenders above it and
+ * descenders below. Adafruit_GFX behaves exactly the same way, which is
+ * why it is worth living with. gfx_fontBaseline() converts:
+ *
+ *     gfx_text(x, y + gfx_fontBaseline(), s, c);   // y = top, either font
+ *
+ * '\n' starts a new line at the original x. Characters outside the
+ * font's range are drawn as '?', or dropped if the font has no '?'.
+ *
+ * Bundled fonts live in src/fonts/ - see FONTS.md for the list, their
+ * flash cost, and how to convert your own with extras/fontconvert.py.
+ */
+void gfx_setFont(const GFXfont *f);
+const GFXfont *gfx_font(void);
+
+/* Baseline-to-baseline line spacing, and the ascent (0 for the built-in
+ * font, since that one is already top-anchored). Both in pixels at
+ * scale 1 - multiply by your scale. */
+int gfx_fontLineHeight(void);
+int gfx_fontBaseline(void);
+
 void gfx_char(int x, int y, char ch, uint8_t c);
+void gfx_charScaled(int x, int y, char ch, uint8_t c, uint8_t scale);
 void gfx_text(int x, int y, const char *s, uint8_t c);
 void gfx_textScaled(int x, int y, const char *s, uint8_t c, uint8_t scale);
+
+/* Advance width of a string in the current font - the number to use for
+ * centring and right-alignment. Multi-line strings report the widest. */
+int gfx_textWidth(const char *s);
+int gfx_textWidthScaled(const char *s, uint8_t scale);
+
+/* Tight ink box of a string drawn at (x, y), same units and origin
+ * convention as gfx_text. Any of the four outputs may be nullptr. */
+void gfx_textBounds(const char *s, int x, int y, uint8_t scale,
+                    int *bx, int *by, int *bw, int *bh);
 
 /* ------------------------------------------------------------------ */
 /* Direct-to-panel paths (bypass the framebuffer entirely)             */
@@ -378,9 +430,24 @@ public:
     void drawSprite(const uint8_t *s, int x, int y, int w, int h, int transparent = -1)
                                                            { gfx_blit(s, x, y, w, h, transparent); }
     void drawChar(int x, int y, char ch, uint8_t c)        { gfx_char(x, y, ch, c); }
+    void drawChar(int x, int y, char ch, uint8_t c, uint8_t scale)
+                                                           { gfx_charScaled(x, y, ch, c, scale); }
     void print(int x, int y, const char *s, uint8_t c)     { gfx_text(x, y, s, c); }
     void print(int x, int y, const char *s, uint8_t c, uint8_t scale)
                                                            { gfx_textScaled(x, y, s, c, scale); }
+
+    /* Fonts. setFont(nullptr) returns to the built-in 5x7. Note that a
+     * custom font takes y as the baseline - see the block above
+     * gfx_setFont() in this header. */
+    void setFont(const GFXfont *f = nullptr)               { gfx_setFont(f); }
+    const GFXfont *font() const                            { return gfx_font(); }
+    int fontLineHeight() const                             { return gfx_fontLineHeight(); }
+    int fontBaseline() const                               { return gfx_fontBaseline(); }
+    int textWidth(const char *s) const                     { return gfx_textWidth(s); }
+    int textWidth(const char *s, uint8_t scale) const      { return gfx_textWidthScaled(s, scale); }
+    void textBounds(const char *s, int x, int y, uint8_t scale,
+                    int *bx, int *by, int *bw, int *bh) const
+                                                           { gfx_textBounds(s, x, y, scale, bx, by, bw, bh); }
 
     /* Direct-to-panel, bypassing the framebuffer */
     void fillRectDirect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t rgb565)

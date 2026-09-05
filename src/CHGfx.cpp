@@ -27,13 +27,63 @@ extern "C" {
 #define PIN_SDCS_PORT CHGFX_SDCS_PORT
 #define PIN_SDCS_BIT  (1u << CHGFX_SDCS_PIN)
 
+/* CFGHR IS WRITE-ONLY ON THE CH32X035. Reading it back does not return
+ * what was written, which is why the vendor GPIO driver keeps a RAM
+ * shadow per port (ch32x035_gpio.c, seeded with the 0x44444444 reset
+ * value = floating input) and rebuilds the whole register from it on
+ * every GPIO_Init. Those shadows are plain globals and the core archive
+ * is linked whole, so we can share them - and we must, for two reasons:
+ *
+ *   - Our own writes would otherwise clobber each other. RST (PB12) and
+ *     SD_CS (PB11) both live in GPIOB's CFGHR. Configuring RST push-pull
+ *     and then configuring SD_CS read the register back, got something
+ *     that was not the value just written, and put PB12's nibble back to
+ *     it. RST ended up an input - floating, driven by nothing, and
+ *     LCD_RST runs straight from the MCU to the panel with no pull-up on
+ *     the net. After ~1 s idle the line drifts below Vih, the ST7735
+ *     reads that as a reset pulse and blanks to white, while the CPU
+ *     carries on streaming frames into a panel that is no longer
+ *     initialised.
+ *
+ *   - Any pinMode() on PB8..PB15 - the buttons, the LED, the buzzer,
+ *     SD_CS - rewrites the whole of CFGHR from the core's shadow. A
+ *     config we had written behind the core's back would be wiped by the
+ *     next such call regardless.
+ *
+ * Going through the same shadow makes our writes and the core's compose,
+ * in either order. CFGLR and CFGXR read back correctly; only CFGHR is
+ * affected. */
+#if defined(CH32X035)
+extern "C" {
+extern volatile uint32_t CFGHR_tmpA;
+extern volatile uint32_t CFGHR_tmpB;
+extern volatile uint32_t CFGHR_tmpC;
+}
+static inline volatile uint32_t *cfgHrShadow(GPIO_TypeDef *port) {
+    if (port == GPIOA) return &CFGHR_tmpA;
+    if (port == GPIOB) return &CFGHR_tmpB;
+    return &CFGHR_tmpC;
+}
+#endif
+
 /* Configure one pin's 4-bit CFGLR/CFGHR field without disturbing the
  * other 7 pins in that register. */
 static inline void cfgPin(GPIO_TypeDef *port, uint8_t pin, uint32_t nibble) {
-    volatile uint32_t *reg = (pin < 8) ? &port->CFGLR : &port->CFGHR;
     uint8_t sh = (uint8_t)((pin & 7) * 4);
-    *reg = (*reg & ~(0xFu << sh)) | (nibble << sh);
+    if (pin < 8) {
+        port->CFGLR = (port->CFGLR & ~(0xFu << sh)) | (nibble << sh);
+        return;
+    }
+#if defined(CH32X035)
+    volatile uint32_t *shadow = cfgHrShadow(port);
+    uint32_t v = (*shadow & ~(0xFu << sh)) | (nibble << sh);
+    *shadow    = v;
+    port->CFGHR = v;
+#else
+    port->CFGHR = (port->CFGHR & ~(0xFu << sh)) | (nibble << sh);
+#endif
 }
+
 
 /* BSHR sets, BCR clears - single-cycle, no read-modify-write. */
 #define CS_LOW()    (PIN_CS_PORT->BCR  = PIN_CS_BIT)
@@ -46,6 +96,15 @@ static inline void cfgPin(GPIO_TypeDef *port, uint8_t pin, uint32_t nibble) {
  *   CNF=10 MODE=11 -> 0xB alternate-function push-pull, max drive     */
 #define CFG_GP_PP    0x3u
 #define CFG_AF_PP    0xBu
+
+/* Re-assert RST as a driven-high push-pull output. Two loads and two
+ * stores, so it is cheap enough to call on every panel access - which is
+ * what keeps the line out of the floating state that resets the panel
+ * even if something outside this driver reconfigures GPIOB. */
+static inline void rstDriveHigh(void) {
+    PIN_RST_PORT->BSHR = PIN_RST_BIT;                 /* level first, */
+    cfgPin(PIN_RST_PORT, CHGFX_RST_PIN, CFG_GP_PP);   /* then drive it */
+}
 
 /* SPI1 CTLR1 bits */
 #define SPI_CPHA     (1u << 0)
@@ -205,14 +264,15 @@ static void gpioInit(void) {
     cfgPin(GPIOA, 5, CFG_AF_PP);
     cfgPin(GPIOA, 7, CFG_AF_PP);
 
-    /* Control pins, general-purpose push-pull. */
-    cfgPin(PIN_CS_PORT,  CHGFX_CS_PIN,  CFG_GP_PP);
-    cfgPin(PIN_DC_PORT,  CHGFX_DC_PIN,  CFG_GP_PP);
-    cfgPin(PIN_RST_PORT, CHGFX_RST_PIN, CFG_GP_PP);
-
+    /* Control pins, general-purpose push-pull. Set the output level
+     * before switching each pin to output: OUTDR reads 0 out of reset, so
+     * configuring first would drive a brief low glitch - on RST that is a
+     * reset pulse into the panel. */
     CS_HIGH();
     DC_DATA();
-    PIN_RST_PORT->BSHR = PIN_RST_BIT;
+    cfgPin(PIN_CS_PORT,  CHGFX_CS_PIN,  CFG_GP_PP);
+    cfgPin(PIN_DC_PORT,  CHGFX_DC_PIN,  CFG_GP_PP);
+    rstDriveHigh();
 
 #ifndef CHGFX_NO_SD_PARK
     /* The microSD slot shares SPI1; park its chip select high so it does
@@ -253,8 +313,10 @@ static void dmaInit(void) {
     NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 }
 
+/* The pin is driven both high and low throughout - it is never handed
+ * back to an input, so the panel only ever sees the pulse we intend. */
 static void panelReset(void) {
-    PIN_RST_PORT->BSHR = PIN_RST_BIT; delay(5);
+    rstDriveHigh();                   delay(5);
     PIN_RST_PORT->BCR  = PIN_RST_BIT; delay(20);
     PIN_RST_PORT->BSHR = PIN_RST_BIT; delay(150);
 }
@@ -680,6 +742,13 @@ void gfx_blockingWrite(const uint8_t *data, uint32_t bytes) {
 /* ================================================================== */
 
 void gfx_setWindow(uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+    /* Every path that talks to the panel funnels through here, so this is
+     * where RST gets re-asserted. Four instructions against the eleven SPI
+     * frames below, and it means a stray pinMode() on another GPIOB pin
+     * can leave RST floating for at most one draw call rather than until
+     * the panel decides it has seen a reset. */
+    rstDriveHigh();
+
     uint16_t x0 = x + s_colStart, x1 = x0 + w - 1;
     uint16_t y0 = y + s_rowStart, y1 = y0 + h - 1;
 
