@@ -28,6 +28,8 @@
  * CPU budget is left for the game after the display is fed.
  */
 #include <CHGfx.h>
+#include <fonts/CHGfx_Tiny3x5.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------ */
 /* Timing helpers                                                      */
@@ -245,6 +247,38 @@ static uint32_t soloWork(uint32_t iters) {
     return a;
 }
 
+/*
+ * 7c. What an async flush costs the CPU. The conversion runs inside the
+ *     DMA interrupt, so a main loop running during the flush loses that
+ *     much of its time. Measure how much work gets done while a flush is
+ *     in flight, against the same work alone.
+ */
+static uint32_t flushCpuCost(int h)
+{
+    const uint32_t CAL = 20000;
+    tic();
+    soloWork(CAL);
+    uint32_t calUs = toc();
+
+    gfx_wait();
+    uint32_t iters = 0;
+    tic();
+    gfx_flushRectAsync(0, 0, GFX_W, h);
+    while (gfx_busy()) { soloWork(50); iters += 50; }
+    uint32_t elapsed = toc();
+    uint32_t worked = (uint32_t)((uint64_t)iters * calUs / CAL);
+    return elapsed > worked ? elapsed - worked : 0;
+}
+
+static void benchFlushCost(void)
+{
+    uint32_t full = 0, half = 0;
+    for (int i = 0; i < 8; i++) { full += flushCpuCost(GFX_H); half += flushCpuCost(GFX_H / 2); }
+    snprintf(line, sizeof line, "7c async flush CPU cost: %u us/full frame, %u us/half",
+             (unsigned)(full / 8), (unsigned)(half / 8));
+    Serial.println(line);
+}
+
 static void benchAsync(void)
 {
     const uint32_t WORK = 20000;
@@ -318,6 +352,114 @@ static void benchDraw(void)
     tic();
     for (uint32_t i = 0; i < N * 2; i++) gfx_fillCircle(64, 64, 30, i & 15);
     report("8h fillCircle r=30", toc(), N * 2, 0);
+}
+
+/*
+ * 13. The 1.3 additions: span sprites, shapes, text effects, row
+ *     operations. CPU only, like test 8.
+ */
+static const uint8_t SLIME[77] = {        /* 16x12 span sprite, see examples/GameKit */
+    0x10, 0x0C, 0x02, 0x5F, 0x30, 0x04, 0x3F, 0x10, 0x35, 0x10, 0x06, 0x2F,
+    0x00, 0x15, 0x11, 0x35, 0x00, 0x06, 0x1F, 0x00, 0x15, 0x11, 0x55, 0x00,
+    0x04, 0x1F, 0x00, 0x95, 0x00, 0x08, 0x0F, 0x00, 0x25, 0x10, 0x15, 0x10,
+    0x25, 0x00, 0x0A, 0x0F, 0x00, 0x25, 0x00, 0x01, 0x15, 0x00, 0x01, 0x25,
+    0x00, 0x08, 0x0F, 0x00, 0x25, 0x10, 0x15, 0x10, 0x25, 0x00, 0x03, 0x00,
+    0xD5, 0x00, 0x05, 0x00, 0x45, 0x36, 0x45, 0x00, 0x05, 0x00, 0x06, 0xB5,
+    0x06, 0x00, 0x02, 0x0F, 0xD0
+};
+
+static void benchExtras(void)
+{
+    const uint32_t N = 200;
+    static uint8_t remap[16];
+    for (int i = 0; i < 16; i++) remap[i] = (uint8_t)(15 - i);
+    gfx_wait();
+
+    tic();
+    for (uint32_t i = 0; i < N * 4; i++) gfx_sprite4(SLIME, (int)(i & 63), (int)((i >> 3) & 63), remap);
+    report("13a sprite4 16x12, remapped", toc(), N * 4, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N; i++) gfx_sprite4(SLIME, (int)(i & 31), 20, remap, 512);
+    report("13b sprite4 scaled 2x", toc(), N, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N; i++) gfx_sprite4Rot(SLIME, 8, 6, 64, 64, (uint8_t)i, 256, remap);
+    report("13c sprite4Rot 16x12", toc(), N, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N; i++) gfx_fillRoundRect(14, 100, 100, 22, 4, i & 15);
+    report("13d fillRoundRect 100x22 r4", toc(), N, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N * 4; i++) gfx_fillEllipse(64, 64, 7, 2, i & 15);
+    report("13e fillEllipse 15x5 (shadow)", toc(), N * 4, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N; i++) gfx_dither(0, 0, 128, 32, i & 15, (uint8_t)(i & 1));
+    report("13f dither 128x32", toc(), N, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N; i++) gfx_remapRect(0, 0, 128, 32, remap);
+    report("13g remapRect 128x32", toc(), N, 0);
+
+    gfx_setFont(&CHGfx_Tiny3x5);
+    tic();
+    for (uint32_t i = 0; i < N; i++) gfx_text(2, 8, "SCORE 001234  LIVES 3", 4);
+    report("13h text Tiny3x5, 21 chars", toc(), N, 0);
+
+    tic();
+    for (uint32_t i = 0; i < N / 4; i++) gfx_textFx(10, 60, "GAME KIT!", 3, 7, 0, 5);
+    report("13i textFx 3x, outline+shadow", toc(), N / 4, 0);
+    gfx_setFont(nullptr);
+
+    uint32_t patRow[GFX_FB_STRIDE / 4];
+    memset(patRow, 0x5A, sizeof patRow);
+    tic();
+    for (uint32_t i = 0; i < N / 4; i++)
+        for (int y = 10; y < GFX_H; y++) gfx_copyRow(y, (const uint8_t *)patRow, 0, GFX_W);
+    report("13j copyRow x118 (a floor)", toc(), N / 4, 0);
+
+    /* The screen shake CHChess started with, and the replacement. */
+    tic();
+    for (uint32_t i = 0; i < N / 10; i++)
+        memmove(gfx_fb + 11 * GFX_FB_STRIDE + 1, gfx_fb + 10 * GFX_FB_STRIDE, 117 * GFX_FB_STRIDE - 1);
+    report("13k shake by memmove (118 rows)", toc(), N / 10, 0);
+    tic();
+    for (uint32_t i = 0; i < N / 10; i++) gfx_scroll(10, 118, 2, 1);
+    report("13l shake by gfx_scroll", toc(), N / 10, 0);
+    tic();
+    for (uint32_t i = 0; i < N / 10; i++) gfx_scroll(10, 118, 1, 1);
+    report("13m gfx_scroll, odd dx (nibbles)", toc(), N / 10, 0);
+}
+
+/*
+ * 14. Racing the beam. The frame is cleared and drawn in two halves;
+ *     "racing" starts the top half as soon as the flush has sent it,
+ *     instead of waiting for the whole frame.
+ */
+static void drawHalf(int y0)
+{
+    gfx_setClip(0, y0, GFX_W, GFX_H / 2);
+    gfx_clear(12);
+    for (int i = 0; i < 16; i++) gfx_sprite4(SLIME, (i * 29) & 111, y0 + ((i * 13) & 51), nullptr);
+    gfx_resetClip();
+}
+
+static void benchRacing(uint32_t frames)
+{
+    tic();
+    for (uint32_t f = 0; f < frames; f++) { gfx_wait(); drawHalf(0); drawHalf(64); gfx_flushAsync(); }
+    gfx_wait();
+    report("14a wait, then draw", toc(), frames, 0);
+    tic();
+    for (uint32_t f = 0; f < frames; f++) {
+        gfx_waitRow(64); drawHalf(0);
+        gfx_wait();      drawHalf(64);
+        gfx_flushAsync();
+    }
+    gfx_wait();
+    report("14b racing the beam", toc(), frames, 0);
 }
 
 /*
@@ -467,10 +609,12 @@ static void runSuite(const char *label, bool includeDraw)
     benchConvert(20);
     benchFlush(30);
     benchAsync();
-    if (includeDraw) benchDraw();   /* CPU-only, identical in both modes */
+    benchFlushCost();
+    if (includeDraw) { benchDraw(); benchExtras(); }   /* CPU-only, identical in both modes */
     benchGame(20);
     benchPartial();
     benchDirtyGame(30);
+    benchRacing(30);
 }
 
 static void showSummaryOnPanel(uint32_t us16, uint32_t us12)

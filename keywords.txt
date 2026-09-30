@@ -55,6 +55,24 @@ setPanelFrameRate	KEYWORD2
 setInverted	KEYWORD2
 fillRectDirect	KEYWORD2
 buffer	KEYWORD2
+setFade	KEYWORD2
+fade	KEYWORD2
+flushRow	KEYWORD2
+waitRow	KEYWORD2
+setClip	KEYWORD2
+resetClip	KEYWORD2
+getClip	KEYWORD2
+drawRoundRect	KEYWORD2
+fillRoundRect	KEYWORD2
+drawEllipse	KEYWORD2
+fillEllipse	KEYWORD2
+dither	KEYWORD2
+remapRect	KEYWORD2
+drawSprite4	KEYWORD2
+drawSprite4Rot	KEYWORD2
+scroll	KEYWORD2
+copyRow	KEYWORD2
+printFx	KEYWORD2
 
 # Free-function API
 gfx_begin	KEYWORD2
@@ -113,6 +131,27 @@ gfx_convertRows_ram	KEYWORD2
 gfx_convertRows_flash	KEYWORD2
 gfx_convertSpan_ram	KEYWORD2
 gfx_chunkScratch	KEYWORD2
+gfx_setFade	KEYWORD2
+gfx_fade	KEYWORD2
+gfx_paletteOut	KEYWORD2
+gfx_flushRow	KEYWORD2
+gfx_waitRow	KEYWORD2
+gfx_setClip	KEYWORD2
+gfx_resetClip	KEYWORD2
+gfx_getClip	KEYWORD2
+gfx_roundRect	KEYWORD2
+gfx_fillRoundRect	KEYWORD2
+gfx_ellipse	KEYWORD2
+gfx_fillEllipse	KEYWORD2
+gfx_dither	KEYWORD2
+gfx_remapRect	KEYWORD2
+gfx_sprite4	KEYWORD2
+gfx_sprite4W	KEYWORD2
+gfx_sprite4H	KEYWORD2
+gfx_sprite4Rot	KEYWORD2
+gfx_scroll	KEYWORD2
+gfx_copyRow	KEYWORD2
+gfx_textFx	KEYWORD2
 
 #######################################
 # Constants (LITERAL1)
@@ -126,6 +165,7 @@ GFX_CHUNK_ROWS	LITERAL1
 GFX_CHUNK_BYTES	LITERAL1
 GFX_16BPP	LITERAL1
 GFX_12BPP	LITERAL1
+GFX_18BPP	LITERAL1
 GFX_DIV2	LITERAL1
 GFX_DIV4	LITERAL1
 GFX_DIV8	LITERAL1
@@ -137,3 +177,4 @@ CHGfx_Sans12	LITERAL1
 CHGfx_SansBold12	LITERAL1
 CHGfx_SansBold16	LITERAL1
 CHGfx_Digits24	LITERAL1
+CHGfx_Tiny3x5	LITERAL1

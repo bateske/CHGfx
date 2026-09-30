@@ -176,3 +176,27 @@ be used in advertising or otherwise to promote the sale, use or other
 dealings in this Font Software without prior written authorization
 from Tavmjong Bah. For further information, contact: tavmjong @ free
 . fr.
+
+
+--------------------------------------------------------------------------------
+4. src/fonts/CHGfx_Tiny3x5.h - the 3x5 font
+--------------------------------------------------------------------------------
+
+The glyphs are the 3x5 font from "Blackjack" for the Arduboy by Press Play
+On Tape, licensed under the Apache License, Version 2.0; the full text of
+that licence is in LICENSE.Apache-2.0 next to this file.
+
+Changes: converted from column bytes to the GFXfont format; the glyphs
+$ , / ' * ( ) < > = % # were added in CHChess, and " & ; @ [ \ ] ^ _ ` { | }
+~ in this library, so that it covers printable ASCII. These changes are
+offered under the same Apache License 2.0.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy
+of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.

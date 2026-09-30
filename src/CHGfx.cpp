@@ -6,7 +6,7 @@
  *   PA4 = LCD_CS, PB0 = LCD_DC, PB12 = LCD_RST, PB11 = SD_CS
  * The panel and the microSD slot share SPI1, so SD_CS is parked high.
  */
-#include "CHGfx.h"
+#include "CHGfx_internal.h"
 
 extern "C" {
 #include "ch32x035.h"
@@ -165,8 +165,7 @@ static inline void rstDriveHigh(void) {
 /* ------------------------------------------------------------------ */
 /* State                                                               */
 /* ------------------------------------------------------------------ */
-uint8_t  gfx_fb[GFX_FB_BYTES];
-uint16_t gfx_pal[16];
+uint8_t  gfx_fb[GFX_FB_BYTES] __attribute__((aligned(4)));   /* word stores everywhere */
 
 static uint8_t  s_div      = GFX_DIV2;
 static uint8_t  s_mode     = GFX_16BPP;
@@ -186,27 +185,21 @@ static uint8_t s_chunk[2][GFX_CHUNK_BYTES] __attribute__((aligned(4)));
 static volatile int8_t   s_sending;   /* buffer index in flight, -1 idle   */
 static volatile int8_t   s_ready;     /* converted buffer waiting, -1 none */
 static volatile uint32_t s_readyLen;  /* bytes in the waiting buffer       */
+static uint32_t          s_dmaCfg;    /* channel CFGR for the flush in flight */
 
-/* Anything the DMA ISR touches must not be a flash constant on a hot
- * path; keep the hot converters in SRAM (see RAMFUNC below). */
-/* Put the hot loops in SRAM. The section name looks odd on purpose:
- * the core's link script routes *(.srodata .srodata.*) into .data,
- * which has a RAM VMA and a flash LMA, so startup copies it for us.
- * A ".data.*" name works identically but makes the assembler warn
- * about section attributes, and ".gnu.linkonce.*" would let the
- * linker discard all but one of these as duplicates. */
-#define RAMFUNC __attribute__((section(".srodata.ramfunc"), noinline))
+/* The hot loops - the converters and the DMA interrupt that drives them -
+ * live in SRAM. See GFX_RAMFUNC in CHGfx_internal.h. */
 
 /* ================================================================== */
 /* Low-level SPI                                                       */
 /* ================================================================== */
 
-static inline void spiWait(void) {
+static GFX_INLINE void spiWait(void) {
     while (!(SPI1->STATR & SPI_TXE)) { }
     while (SPI1->STATR & SPI_BSY)    { }
 }
 
-static inline void spiSet8(void) {
+static GFX_INLINE void spiSet8(void) {
     if (SPI1->CTLR1 & SPI_DFF16) {
         SPI1->CTLR1 &= ~SPI_SPE;
         SPI1->CTLR1 &= ~SPI_DFF16;
@@ -214,7 +207,7 @@ static inline void spiSet8(void) {
     }
 }
 
-static inline void spiSet16(void) {
+static GFX_INLINE void spiSet16(void) {
     if (!(SPI1->CTLR1 & SPI_DFF16)) {
         SPI1->CTLR1 &= ~SPI_SPE;
         SPI1->CTLR1 |= SPI_DFF16;
@@ -466,7 +459,7 @@ void gfx_setColorMode(uint8_t mode) {
     gfx_wait();
     s_mode = mode;
     applyColorMode();
-    gfx_setPalette(gfx_pal, 16);   /* LUT layout depends on the mode */
+    gfx__paletteTouch();           /* LUT layout depends on the mode */
 }
 
 uint8_t  gfx_colorMode(void) { return s_mode; }
@@ -498,17 +491,20 @@ void gfx_setInverted(bool on) {
 }
 
 /* ================================================================== */
-/* Palette + expansion LUT                                             */
+/* Expansion LUT                                                       */
 /* ================================================================== */
+/* The palette itself lives in CHGfx_palette.cpp. Changes there only mark
+ * it dirty; the LUT is rebuilt here, at the start of the next flush, once
+ * the previous flush has stopped reading it. */
 
-static void buildLut(void) {
+static void buildLut(const uint16_t *pal) {
     if (s_mode == GFX_16BPP) {
         /* Entry holds two RGB565 pixels. A single 32-bit store writes
          * both; on this little-endian core the low halfword lands first,
          * which is the even-x pixel, which is what the panel wants. */
         for (uint32_t b = 0; b < 256; b++) {
-            uint32_t lo = gfx_pal[b & 0x0F];
-            uint32_t hi = gfx_pal[b >> 4];
+            uint32_t lo = pal[b & 0x0F];
+            uint32_t hi = pal[b >> 4];
             s_lut[b] = lo | (hi << 16);
         }
     } else if (s_mode == GFX_18BPP) {
@@ -517,7 +513,7 @@ static void buildLut(void) {
          * indexed by nibble instead and do two lookups per source byte;
          * the budget at 18 bpp is 48 cycles/px, so it costs nothing. */
         for (uint8_t i = 0; i < 16; i++) {
-            uint16_t c = gfx_pal[i];
+            uint16_t c = pal[i];
             uint32_t r = (c >> 11) & 0x1F;          /* 5 bits -> 6 */
             uint32_t g = (c >> 5)  & 0x3F;          /* already 6   */
             uint32_t b =  c        & 0x1F;
@@ -533,7 +529,7 @@ static void buildLut(void) {
          * Store them in the low 24 bits, byte 0 in the LSB. */
         uint16_t p12[16];
         for (uint8_t i = 0; i < 16; i++) {
-            uint16_t c = gfx_pal[i];
+            uint16_t c = pal[i];
             uint8_t r = (c >> 12) & 0x0F;            /* RGB565 R[4:1] */
             uint8_t g = (c >> 7)  & 0x0F;            /* RGB565 G[5:2] */
             uint8_t bl = (c >> 1) & 0x0F;            /* RGB565 B[4:1] */
@@ -550,39 +546,15 @@ static void buildLut(void) {
     }
 }
 
-void gfx_setPalette(const uint16_t *rgb565, uint8_t count) {
-    if (rgb565 != gfx_pal) {
-        for (uint8_t i = 0; i < count && i < 16; i++) gfx_pal[i] = rgb565[i];
-    }
-    buildLut();
-}
-
-/* Nearest palette entry, by squared distance in RGB565's own component
- * space. Weighted 2:4:1 after the usual luminance rule of thumb, scaled
- * so the 5/6/5 bit widths do not skew the result toward green. */
-uint8_t gfx_nearest(uint16_t rgb565) {
-    int r = (rgb565 >> 11) & 0x1F;
-    int g = (rgb565 >> 5)  & 0x3F;
-    int b =  rgb565        & 0x1F;
-    uint8_t best = 0;
-    int32_t bestD = 0x7FFFFFFF;
-    for (uint8_t i = 0; i < 16; i++) {
-        int dr = r - ((gfx_pal[i] >> 11) & 0x1F);
-        int dg = g - ((gfx_pal[i] >> 5)  & 0x3F);
-        int db = b - ( gfx_pal[i]        & 0x1F);
-        int32_t d = 8 * dr * dr + 4 * dg * dg + 4 * db * db;
-        if (d < bestD) { bestD = d; best = i; }
-    }
-    return best;
+/* Rebuild the LUT if the palette, the fade or the colour mode changed.
+ * Only ever called with no flush in flight. */
+static void syncLut(void) {
+    uint16_t out[16];
+    if (gfx__paletteTake(out)) buildLut(out);
 }
 
 /* The single global instance behind the class API. */
 CHGfx Gfx;
-
-void gfx_setPaletteEntry(uint8_t index, uint16_t rgb565) {
-    gfx_pal[index & 0x0F] = rgb565;
-    buildLut();
-}
 
 /* ================================================================== */
 /* The conversion inner loops                                          */
@@ -596,7 +568,7 @@ void gfx_setPaletteEntry(uint8_t index, uint16_t rgb565) {
  */
 
 /* 16 bpp: one LUT load + one word store per two pixels. */
-static inline uint32_t conv565(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
+static GFX_INLINE uint32_t conv565(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
 {
     uint32_t *d = (uint32_t *)dst;
     const uint32_t *lut = s_lut;
@@ -615,7 +587,7 @@ static inline uint32_t conv565(uint8_t *dst, const uint8_t *src, uint32_t srcByt
  * three naturally aligned word stores. Doing it in groups of four keeps
  * every store word-aligned, which matters because the QingKe core does
  * not guarantee cheap unaligned access. */
-static inline uint32_t conv444(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
+static GFX_INLINE uint32_t conv444(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
 {
     uint32_t *d = (uint32_t *)dst;
     const uint32_t *lut = s_lut;
@@ -637,7 +609,7 @@ static inline uint32_t conv444(uint8_t *dst, const uint8_t *src, uint32_t srcByt
 /* 18 bpp: two source bytes (4 px) become twelve output bytes, i.e.
  * three aligned word stores - the same packing shuffle as conv444, just
  * fed one pixel per nibble instead of one pixel per half-nibble-pair. */
-static inline uint32_t conv666(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
+static GFX_INLINE uint32_t conv666(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
 {
     uint32_t *d = (uint32_t *)dst;
     const uint32_t *pal = s_lut;          /* only [0..15] used here */
@@ -657,23 +629,29 @@ static inline uint32_t conv666(uint8_t *dst, const uint8_t *src, uint32_t srcByt
     return (uint32_t)((uint8_t *)d - dst);
 }
 
-RAMFUNC uint32_t gfx_convertRows_ram(uint8_t *dst, uint16_t row, uint16_t rows)
+/* 18 bpp from the framebuffer is rare, and its budget is 48 cycles a
+ * pixel against 32, so its converter stays in flash and leaves the SRAM
+ * to the two that matter. */
+__attribute__((noinline)) static uint32_t convSpan666(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
 {
-    const uint8_t *src = gfx_fb + (uint32_t)row * GFX_FB_STRIDE;
-    uint32_t n = (uint32_t)rows * GFX_FB_STRIDE;
-    if (s_mode == GFX_12BPP) return conv444(dst, src, n);
-    if (s_mode == GFX_18BPP) return conv666(dst, src, n);
-    return conv565(dst, src, n);
+    return conv666(dst, src, srcBytes);
 }
 
-/* Arbitrary run of framebuffer bytes -> panel format. This is what the
- * partial-rectangle path uses, since a sub-rectangle's rows are not
- * contiguous in the framebuffer. */
-RAMFUNC uint32_t gfx_convertSpan_ram(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
+/* Arbitrary run of framebuffer bytes -> panel format. This is the one
+ * copy of the converters in SRAM: whole rows, partial rectangles (whose
+ * rows are not contiguous in the framebuffer) and the ISR all come
+ * through here. */
+GFX_RAMFUNC(convspan) uint32_t gfx_convertSpan_ram(uint8_t *dst, const uint8_t *src, uint32_t srcBytes)
 {
     if (s_mode == GFX_12BPP) return conv444(dst, src, srcBytes);
-    if (s_mode == GFX_18BPP) return conv666(dst, src, srcBytes);
+    if (s_mode == GFX_18BPP) return convSpan666(dst, src, srcBytes);
     return conv565(dst, src, srcBytes);
+}
+
+GFX_RAMFUNC(convrows) uint32_t gfx_convertRows_ram(uint8_t *dst, uint16_t row, uint16_t rows)
+{
+    return gfx_convertSpan_ram(dst, gfx_fb + (uint32_t)row * GFX_FB_STRIDE,
+                               (uint32_t)rows * GFX_FB_STRIDE);
 }
 
 __attribute__((noinline))
@@ -692,7 +670,7 @@ uint32_t gfx_convertRows_flash(uint8_t *dst, uint16_t row, uint16_t rows)
 
 /* Kick a transfer. `halfword` selects 16-bit SPI frames, which halves
  * the number of DMA bus cycles for 16 bpp data. */
-static inline void dmaStart(const void *src, uint32_t bytes, bool halfword,
+static GFX_INLINE void dmaStart(const void *src, uint32_t bytes, bool halfword,
                             bool memInc, bool irq)
 {
     SPI1->CTLR2 &= ~(1u << 1);                 /* TXDMAEN off while we poke */
@@ -715,7 +693,21 @@ static inline void dmaStart(const void *src, uint32_t bytes, bool halfword,
     DMA1_Channel3->CFGR |= DMA_EN;
 }
 
-static inline void dmaStopAndDrain(void) {
+/* Re-arm the channel for the next chunk of the async flush in flight.
+ * The SPI frame size cannot change mid-flush and the ISR has already
+ * cleared the flags, so this is dmaStart() minus everything that would
+ * be a no-op: four stores and two read-modify-writes. */
+static GFX_INLINE void dmaRearm(const uint8_t *src, uint32_t bytes)
+{
+    SPI1->CTLR2 &= ~(1u << 1);
+    DMA1_Channel3->MADDR = (uint32_t)src;
+    DMA1_Channel3->CNTR  = (s_dmaCfg & DMA_MSIZE_16) ? (bytes >> 1) : bytes;
+    DMA1_Channel3->CFGR  = s_dmaCfg;
+    SPI1->CTLR2 |= (1u << 1);
+    DMA1_Channel3->CFGR  = s_dmaCfg | DMA_EN;
+}
+
+static GFX_INLINE void dmaStopAndDrain(void) {
     while (!(DMA1->INTFR & DMA_CH3_TCIF)) { }
     DMA1_Channel3->CFGR &= ~DMA_EN;
     DMA1->INTFCR = DMA_CH3_ALL;
@@ -793,6 +785,7 @@ void gfx_directFillRect(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint16_t rgb
  * 8 (12 bpp, where the converter works in groups of 8 pixels). Rounding
  * out is always safe - you send slightly more than you had to.
  */
+namespace {
 struct FlushJob {
     uint16_t x0;        /* left edge, already aligned            */
     uint16_t wpx;       /* width in pixels, already aligned      */
@@ -801,17 +794,19 @@ struct FlushJob {
     uint16_t endRow;    /* one past the last row                 */
     uint32_t chunkLen;  /* bytes a full chunk produces           */
 };
+}  // namespace
 static volatile FlushJob s_job;
 
 /* Convert `rows` rows of the job's column span into dst. */
-static RAMFUNC uint32_t convertJobRows(uint8_t *dst, uint16_t row, uint16_t rows)
+static GFX_RAMFUNC(convjob) uint32_t convertJobRows(uint8_t *dst, uint16_t row, uint16_t rows)
 {
     uint16_t x0  = s_job.x0;
     uint16_t wpx = s_job.wpx;
     uint32_t srcBytesPerRow = wpx >> 1;
 
-    if (x0 == 0 && wpx == GFX_W)
-        return gfx_convertRows_ram(dst, row, rows);   /* contiguous fast path */
+    if (x0 == 0 && wpx == GFX_W)                      /* contiguous fast path */
+        return gfx_convertSpan_ram(dst, gfx_fb + (uint32_t)row * GFX_FB_STRIDE,
+                                   (uint32_t)rows * GFX_FB_STRIDE);
 
     const uint8_t *src = gfx_fb + (uint32_t)row * GFX_FB_STRIDE + (x0 >> 1);
     uint8_t *d = dst;
@@ -825,9 +820,10 @@ static RAMFUNC uint32_t convertJobRows(uint8_t *dst, uint16_t row, uint16_t rows
 static uint32_t setupJob(int x, int y, int w, int h)
 {
     /* Wait FIRST. An async flush still in flight has the DMA ISR reading
-     * s_job every chunk; overwriting it underneath would corrupt the
-     * transfer in progress. */
+     * s_job and the LUT every chunk; changing either underneath would
+     * corrupt the transfer in progress. */
     gfx_wait();
+    syncLut();
 
     /* Clip, then align outward. */
     if (x < 0) { w += x; x = 0; }
@@ -865,7 +861,7 @@ static uint32_t setupJob(int x, int y, int w, int h)
 }
 
 /* How many rows the next chunk should carry (the last one may be short). */
-static inline uint16_t rowsThisChunk(void) {
+static GFX_INLINE uint16_t rowsThisChunk(void) {
     uint16_t left = s_job.endRow - s_job.row;
     return left < s_job.rowsPer ? left : s_job.rowsPer;
 }
@@ -919,8 +915,11 @@ void gfx_flushRectAsync(int x, int y, int w, int h)
         s_ready = -1;
     }
 
+    bool halfword = (s_mode == GFX_16BPP);
+    s_dmaCfg = DMA_DIR_M2P | DMA_PL_VHIGH | DMA_MINC | DMA_TCIE |
+               (halfword ? (DMA_PSIZE_16 | DMA_MSIZE_16) : 0);
     s_sending = 0;
-    dmaStart(s_chunk[0], n, s_mode == GFX_16BPP, true, true);
+    dmaStart(s_chunk[0], n, halfword, true, true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -981,8 +980,33 @@ void gfx_flushAsync(void) { gfx_flushRectAsync(0, 0, GFX_W, GFX_H); }
 bool gfx_busy(void) { return s_sending >= 0; }
 void gfx_wait(void) { while (s_sending >= 0) { } }
 
+/* Flush progress. The ISR advances s_job.row only after a chunk's rows
+ * are fully converted, so every row above it has been read for the last
+ * time and is free to draw into, even while the DMA is still sending it.
+ * Once the last chunk is converted, every row is free. */
+int gfx_flushRow(void) {
+    if (s_sending < 0) return GFX_H;
+    uint16_t row = s_job.row;
+    return row >= s_job.endRow ? GFX_H : (int)row;
+}
+
+void gfx_waitRow(int y) {
+    while (gfx_flushRow() < y) { }
+}
+
+/* The DMA interrupt runs once per chunk - 64 times a full frame at 12 or
+ * 16 bpp - and converts the next chunk each time. The conversion always
+ * runs in SRAM. The handler around it stays in flash unless you build
+ * with -DCHGFX_ISR_IN_SRAM: in SRAM it saves 0.1-0.25 ms of CPU per full
+ * frame (4-9%), and costs ~330 bytes of SRAM that a game near the limit
+ * cannot spare. */
+#ifdef CHGFX_ISR_IN_SRAM
+#define DMA_ISR_PLACEMENT GFX_RAMFUNC(dmaisr)
+#else
+#define DMA_ISR_PLACEMENT
+#endif
 extern "C" void DMA1_Channel3_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-extern "C" void DMA1_Channel3_IRQHandler(void)
+extern "C" DMA_ISR_PLACEMENT void DMA1_Channel3_IRQHandler(void)
 {
     DMA1_Channel3->CFGR &= ~DMA_EN;
     DMA1->INTFCR = DMA_CH3_ALL;
@@ -995,7 +1019,7 @@ extern "C" void DMA1_Channel3_IRQHandler(void)
         uint32_t n = s_readyLen;
         s_sending = ready;
         s_ready   = -1;
-        dmaStart(s_chunk[ready], n, s_mode == GFX_16BPP, true, true);
+        dmaRearm(s_chunk[ready], n);
 
         if (s_job.row < s_job.endRow) {
             uint16_t r = rowsThisChunk();
