@@ -6,22 +6,54 @@
  * word store paints EIGHT pixels. That is the whole reason a paletted
  * buffer beats a full-colour one on a part this small - fill rate scales
  * with bits, not pixels.
+ *
+ * Every primitive clips to gfx__clip, the clip rectangle, which is the
+ * screen unless gfx_setClip() says otherwise. The primitives already
+ * clipped to the screen, so the clip is a change of bounds, not a second
+ * test.
  */
-#include "CHGfx.h"
+#include "CHGfx_internal.h"
 #include "CHGfx_font.h"
 
-#define RAMFUNC __attribute__((section(".srodata.ramfunc"), noinline))
+#define rowPtr gfx__row
 
-static inline uint8_t *rowPtr(int y) { return gfx_fb + y * GFX_FB_STRIDE; }
+GfxClip gfx__clip = { 0, 0, GFX_W, GFX_H };
+
+/* ------------------------------------------------------------------ */
+/* Clip rectangle                                                      */
+/* ------------------------------------------------------------------ */
+void gfx_setClip(int x, int y, int w, int h) {
+    int x1 = x + w, y1 = y + h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x1 > GFX_W) x1 = GFX_W;
+    if (y1 > GFX_H) y1 = GFX_H;
+    if (x1 < x) x1 = x;                /* empty, but still well-formed */
+    if (y1 < y) y1 = y;
+    if (x > GFX_W) x = x1 = GFX_W;
+    if (y > GFX_H) y = y1 = GFX_H;
+    gfx__clip.x0 = (int16_t)x;  gfx__clip.y0 = (int16_t)y;
+    gfx__clip.x1 = (int16_t)x1; gfx__clip.y1 = (int16_t)y1;
+}
+
+void gfx_resetClip(void) { gfx_setClip(0, 0, GFX_W, GFX_H); }
+
+void gfx_getClip(int *x, int *y, int *w, int *h) {
+    if (x) *x = gfx__clip.x0;
+    if (y) *y = gfx__clip.y0;
+    if (w) *w = gfx__clip.x1 - gfx__clip.x0;
+    if (h) *h = gfx__clip.y1 - gfx__clip.y0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Pixels                                                              */
 /* ------------------------------------------------------------------ */
-void gfx_pixel(int x, int y, uint8_t c) {
-    if ((unsigned)x >= GFX_W || (unsigned)y >= GFX_H) return;
-    uint8_t *p = rowPtr(y) + (x >> 1);
-    if (x & 1) *p = (uint8_t)((*p & 0x0F) | (c << 4));
-    else       *p = (uint8_t)((*p & 0xF0) | (c & 0x0F));
+/* In SRAM: lines and circles call it once per pixel. */
+GFX_RAMFUNC(pixel) void gfx_pixel(int x, int y, uint8_t c) {
+    const GfxClip k = gfx__clip;
+    if ((unsigned)(x - k.x0) >= (unsigned)(k.x1 - k.x0) ||
+        (unsigned)(y - k.y0) >= (unsigned)(k.y1 - k.y0)) return;
+    gfx__plot(rowPtr(y), x, (uint8_t)(c & 0x0F));
 }
 
 uint8_t gfx_getPixel(int x, int y) {
@@ -33,7 +65,16 @@ uint8_t gfx_getPixel(int x, int y) {
 /* ------------------------------------------------------------------ */
 /* Clear - one word store paints 8 pixels                              */
 /* ------------------------------------------------------------------ */
-RAMFUNC void gfx_clear(uint8_t c) {
+/*
+ * A note on the SRAM functions here. The board compiles with
+ * -msave-restore, which saves callee-saved registers through helper
+ * routines in libgcc - in FLASH. A hot SRAM function that calls anything,
+ * or runs out of scratch registers, detours through flash on every call.
+ * So the ones called per pixel or per row stay leaves: gfx_clear's clipped
+ * case is a separate call, and gfx_hline carries its own copy of the span
+ * loop rather than calling gfx__span.
+ */
+GFX_RAMFUNC(clearall) static void clearAll(uint8_t c) {
     uint32_t v = (uint32_t)(c & 0x0F);
     v |= v << 4; v |= v << 8; v |= v << 16;
     uint32_t *d = (uint32_t *)gfx_fb;
@@ -43,23 +84,27 @@ RAMFUNC void gfx_clear(uint8_t c) {
     }
 }
 
+void gfx_clear(uint8_t c) {
+    const GfxClip k = gfx__clip;
+    if (k.x0 != 0 || k.y0 != 0 || k.x1 != GFX_W || k.y1 != GFX_H)
+        gfx_fillRect(k.x0, k.y0, k.x1 - k.x0, k.y1 - k.y0, c);
+    else
+        clearAll(c);
+}
+
 /* ------------------------------------------------------------------ */
 /* Horizontal span: ragged nibble ends, word-store middle              */
 /* ------------------------------------------------------------------ */
-RAMFUNC void gfx_hline(int x, int y, int w, uint8_t c) {
-    if ((unsigned)y >= GFX_H || w <= 0) return;
-    if (x < 0) { w += x; x = 0; }
-    if (x + w > GFX_W) w = GFX_W - x;
+static GFX_INLINE void spanBody(uint8_t *row, int x0, int x1, uint8_t c) {
+    int w = x1 - x0;
     if (w <= 0) return;
-
-    uint8_t *p = rowPtr(y) + (x >> 1);
-    c &= 0x0F;
+    uint8_t *p = row + (x0 >> 1);
 
     /* Odd left edge: patch the high nibble of the first byte. */
-    if (x & 1) { *p = (uint8_t)((*p & 0x0F) | (c << 4)); p++; w--; }
+    if (x0 & 1) { *p = (uint8_t)((*p & 0x0F) | (c << 4)); p++; w--; }
 
     uint8_t  pair = (uint8_t)(c | (c << 4));
-    uint32_t quad = (uint32_t)pair; quad |= quad << 8; quad |= quad << 16;
+    uint32_t quad = pair * 0x01010101u;
 
     /* Align to a word boundary a byte at a time. */
     while (w >= 2 && ((uintptr_t)p & 3)) { *p++ = pair; w -= 2; }
@@ -70,10 +115,26 @@ RAMFUNC void gfx_hline(int x, int y, int w, uint8_t c) {
     if (w) *p = (uint8_t)((*p & 0xF0) | c);
 }
 
+GFX_RAMFUNC(span) void gfx__span(uint8_t *row, int x0, int x1, uint8_t c) {
+    spanBody(row, x0, x1, c);
+}
+
+GFX_RAMFUNC(hline) void gfx_hline(int x, int y, int w, uint8_t c) {
+    const GfxClip k = gfx__clip;
+    if ((unsigned)(y - k.y0) >= (unsigned)(k.y1 - k.y0) || w <= 0) return;
+    int x1 = x + w;
+    if (x < k.x0) x = k.x0;
+    if (x1 > k.x1) x1 = k.x1;
+    spanBody(rowPtr(y), x, x1, (uint8_t)(c & 0x0F));
+}
+
 void gfx_vline(int x, int y, int h, uint8_t c) {
-    if ((unsigned)x >= GFX_W || h <= 0) return;
-    if (y < 0) { h += y; y = 0; }
-    if (y + h > GFX_H) h = GFX_H - y;
+    const GfxClip k = gfx__clip;
+    if ((unsigned)(x - k.x0) >= (unsigned)(k.x1 - k.x0) || h <= 0) return;
+    int y1 = y + h;
+    if (y < k.y0) y = k.y0;
+    if (y1 > k.y1) y1 = k.y1;
+    h = y1 - y;
     if (h <= 0) return;
 
     uint8_t *p = rowPtr(y) + (x >> 1);
@@ -87,9 +148,15 @@ void gfx_vline(int x, int y, int h, uint8_t c) {
 }
 
 void gfx_fillRect(int x, int y, int w, int h, uint8_t c) {
-    if (y < 0) { h += y; y = 0; }
-    if (y + h > GFX_H) h = GFX_H - y;
-    while (h-- > 0) gfx_hline(x, y++, w, c);
+    const GfxClip k = gfx__clip;
+    if (w <= 0 || h <= 0) return;
+    int x1 = x + w, y1 = y + h;
+    if (x < k.x0) x = k.x0;
+    if (y < k.y0) y = k.y0;
+    if (x1 > k.x1) x1 = k.x1;
+    if (y1 > k.y1) y1 = k.y1;
+    if (x >= x1) return;
+    for (; y < y1; y++) gfx_hline(x, y, x1 - x, c);
 }
 
 void gfx_rect(int x, int y, int w, int h, uint8_t c) {
@@ -158,18 +225,19 @@ void gfx_fillCircle(int cx, int cy, int r, uint8_t c) {
  * Sprites stored with even width and blitted to even x are ~8x faster
  * than the transparent path, which is worth designing your art around.
  */
-RAMFUNC void gfx_blit(const uint8_t *spr, int x, int y, int w, int h, int transparent)
+GFX_RAMFUNC(blit) void gfx_blit(const uint8_t *spr, int x, int y, int w, int h, int transparent)
 {
+    const GfxClip k = gfx__clip;
     int srcStride = (w + 1) >> 1;
 
     int sy0 = 0;
-    if (y < 0) { sy0 = -y; h += y; y = 0; }
-    if (y + h > GFX_H) h = GFX_H - y;
+    if (y < k.y0) { sy0 = k.y0 - y; h -= sy0; y = k.y0; }
+    if (y + h > k.y1) h = k.y1 - y;
     if (h <= 0) return;
 
     int sx0 = 0;
-    if (x < 0) { sx0 = -x; w += x; x = 0; }
-    if (x + w > GFX_W) w = GFX_W - x;
+    if (x < k.x0) { sx0 = k.x0 - x; w -= sx0; x = k.x0; }
+    if (x + w > k.x1) w = k.x1 - x;
     if (w <= 0) return;
 
     const uint8_t *s = spr + sy0 * srcStride;
@@ -296,6 +364,11 @@ const GFXfont *gfx_font(void)   { return s_font; }
 int gfx_fontLineHeight(void)    { return s_font ? (int)s_font->yAdvance : 8; }
 int gfx_fontBaseline(void)      { return s_font ? (int)s_ascent : 0; }
 
+const uint8_t *gfx__builtinGlyph(char ch) {
+    if (ch < 32 || ch > 126) ch = '?';
+    return chgfx_font5x7 + (ch - 32) * 5;
+}
+
 /* Characters outside the font's range fall back to '?', and if the font
  * has no '?' either - a digits-only font, say - they are dropped, which
  * is what Adafruit_GFX does. */
@@ -314,47 +387,56 @@ static const GFXglyph *glyphFor(const GFXfont *f, unsigned char ch) {
  * pointer and the nibble shift are hoisted out and only the row stride
  * is added per pixel.
  */
-RAMFUNC static void charBuiltin(int x, int y, char ch, uint8_t c) {
+GFX_RAMFUNC(charbuiltin) static void charBuiltin(int x, int y, char ch, uint8_t c) {
     if (ch < 32 || ch > 126) ch = '?';
     const uint8_t *g = chgfx_font5x7 + (ch - 32) * 5;
+    const GfxClip k = gfx__clip;
     c &= 0x0F;
 
+    /* Clip once per glyph, not per pixel: the visible columns, and the
+     * visible rows as a mask over each column's bits. */
     int row0 = y, row1 = y + 7;
-    if (row0 < 0) row0 = 0;
-    if (row1 > GFX_H) row1 = GFX_H;
-    if (row0 >= row1) return;
+    if (row0 < k.y0) row0 = k.y0;
+    if (row1 > k.y1) row1 = k.y1;
+    int col0 = k.x0 - x, col1 = k.x1 - x;
+    if (col0 < 0) col0 = 0;
+    if (col1 > 5) col1 = 5;
+    if (row0 >= row1 || col0 >= col1) return;
+    const int shift = row0 - y;
+    const uint8_t keep = (uint8_t)((1u << (row1 - row0)) - 1);
+    uint8_t *base = rowPtr(row0);
 
-    for (int col = 0; col < 5; col++) {
-        int px = x + col;
-        if ((unsigned)px >= GFX_W) continue;
-        uint8_t bits = g[col];
+    for (int col = col0; col < col1; col++) {
+        uint8_t bits = (uint8_t)((g[col] >> shift) & keep);
         if (!bits) continue;
-
-        uint8_t *p = rowPtr(row0) + (px >> 1);
-        bits >>= (row0 - y);
+        int px = x + col;
+        uint8_t *p = base + (px >> 1);
         if (px & 1) {
             uint8_t v = (uint8_t)(c << 4);
-            for (int r = row0; r < row1 && bits; r++, p += GFX_FB_STRIDE) {
+            for (; bits; bits >>= 1, p += GFX_FB_STRIDE)
                 if (bits & 1) *p = (uint8_t)((*p & 0x0F) | v);
-                bits >>= 1;
-            }
         } else {
-            for (int r = row0; r < row1 && bits; r++, p += GFX_FB_STRIDE) {
+            for (; bits; bits >>= 1, p += GFX_FB_STRIDE)
                 if (bits & 1) *p = (uint8_t)((*p & 0xF0) | c);
-                bits >>= 1;
-            }
         }
     }
 }
 
+/* Scaled: each vertical run of set bits in a column is one fillRect.
+ * Seven rows, like the unscaled path: the table's bit 7 is not drawn. */
 static void charBuiltinScaled(int x, int y, char ch, uint8_t c, uint8_t scale) {
     if (ch < 32 || ch > 126) ch = '?';
     const uint8_t *g = chgfx_font5x7 + (ch - 32) * 5;
     for (int col = 0; col < 5; col++) {
-        uint8_t bits = g[col];
-        for (int row = 0; row < 7; row++)
-            if (bits & (1u << row))
-                gfx_fillRect(x + col * scale, y + row * scale, scale, scale, c);
+        uint8_t bits = g[col] & 0x7F;
+        int row = 0;
+        while (bits) {
+            while (!(bits & 1)) { bits >>= 1; row++; }
+            int n = 0;
+            while (bits & 1) { bits >>= 1; n++; }
+            gfx_fillRect(x + col * scale, y + row * scale, scale, n * scale, c);
+            row += n;
+        }
     }
 }
 
@@ -367,24 +449,29 @@ static void charBuiltinScaled(int x, int y, char ch, uint8_t c, uint8_t scale) {
  * one shortcut that matters: an all-zero byte skips up to eight columns
  * in a single step, and in a typical glyph most bytes are mostly zero.
  */
-RAMFUNC static void drawGlyph1(const uint8_t *bmp, const GFXglyph *g,
-                               int x, int y, uint8_t c)
+GFX_RAMFUNC(glyph1) static void drawGlyph1(const uint8_t *bmp, const GFXglyph *g,
+                                           int x, int y, uint8_t c)
 {
     int gw = g->width, gh = g->height;
     if (!gw || !gh) return;
 
+    const GfxClip k = gfx__clip;
     const uint8_t *p = bmp + g->bitmapOffset;
     int gx = x + g->xOffset;
     int gy = y + g->yOffset;
+    /* Wholly outside the clip: nothing to consume, since every glyph
+     * starts at its own bitmapOffset. */
+    if (gx >= k.x1 || gx + gw <= k.x0 || gy >= k.y1 || gy + gh <= k.y0) return;
     c &= 0x0F;
     uint8_t lo = c, hi = (uint8_t)(c << 4);
+    const unsigned cw = (unsigned)(k.x1 - k.x0);
 
     uint32_t cur = 0;
     int nbits = 0;
 
     for (int r = 0; r < gh; r++) {
         int py = gy + r;
-        uint8_t *rp = ((unsigned)py < (unsigned)GFX_H) ? rowPtr(py) : nullptr;
+        uint8_t *rp = (py >= k.y0 && py < k.y1) ? rowPtr(py) : nullptr;
         int col = 0;
         while (col < gw) {
             if (!nbits) { cur = *p++; nbits = 8; }
@@ -396,7 +483,7 @@ RAMFUNC static void drawGlyph1(const uint8_t *bmp, const GFXglyph *g,
             }
             if ((cur & 0x80) && rp) {
                 unsigned px = (unsigned)(gx + col);
-                if (px < (unsigned)GFX_W) {
+                if (px - (unsigned)k.x0 < cw) {
                     uint8_t *q = rp + (px >> 1);
                     if (px & 1) *q = (uint8_t)((*q & 0x0F) | hi);
                     else        *q = (uint8_t)((*q & 0xF0) | lo);
@@ -408,6 +495,8 @@ RAMFUNC static void drawGlyph1(const uint8_t *bmp, const GFXglyph *g,
     }
 }
 
+/* Scaled: each horizontal run of set bits becomes one fillRect, so a
+ * stroke costs a call per run instead of a call per font pixel. */
 static void drawGlyphScaled(const uint8_t *bmp, const GFXglyph *g,
                             int x, int y, uint8_t c, uint8_t scale)
 {
@@ -422,20 +511,23 @@ static void drawGlyphScaled(const uint8_t *bmp, const GFXglyph *g,
     int nbits = 0;
 
     for (int r = 0; r < gh; r++) {
-        int col = 0;
+        int col = 0, run = -1;             /* run = first column of the open run */
+        int ry = gy + r * scale;
         while (col < gw) {
             if (!nbits) { cur = *p++; nbits = 8; }
-            if (!cur) {
+            if (!cur) {                    /* rest of this byte is blank */
+                if (run >= 0) { gfx_fillRect(gx + run * scale, ry, (col - run) * scale, scale, c); run = -1; }
                 int take = gw - col;
                 if (take > nbits) take = nbits;
                 col += take; nbits -= take;
                 continue;
             }
-            if (cur & 0x80)
-                gfx_fillRect(gx + col * scale, gy + r * scale, scale, scale, c);
+            if (cur & 0x80) { if (run < 0) run = col; }
+            else if (run >= 0) { gfx_fillRect(gx + run * scale, ry, (col - run) * scale, scale, c); run = -1; }
             cur = (cur << 1) & 0xFF;
             nbits--; col++;
         }
+        if (run >= 0) gfx_fillRect(gx + run * scale, ry, (col - run) * scale, scale, c);
     }
 }
 

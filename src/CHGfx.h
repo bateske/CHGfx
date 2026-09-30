@@ -29,7 +29,9 @@
  *   * A 256-entry uint32 lookup table expands one framebuffer byte
  *     (= 2 pixels) into one 32-bit store. Conversion costs ~3 cycles per
  *     pixel against a 32-cycle-per-pixel SPI budget, so the wire stays
- *     saturated and the framebuffer is effectively free.
+ *     saturated. Free for the WIRE, not for the CPU: an async flush
+ *     still spends its conversion time inside the DMA interrupt - see
+ *     "What a flush costs the CPU" below gfx_flushAsync().
  *   * Optional 12 bpp (RGB444) output - ST7735 COLMOD 0x03. Three bytes
  *     per two pixels instead of four: 25% less traffic, and with a
  *     16-colour palette you lose nothing you were actually using.
@@ -75,7 +77,10 @@
 #define GFX_FB_BYTES     (GFX_FB_STRIDE * GFX_H)  /* 8192 bytes        */
 
 /* Rows converted per DMA chunk. Two chunk buffers are allocated, so
- * this directly costs GFX_W * GFX_CHUNK_ROWS * 4 bytes of SRAM.
+ * this directly costs GFX_W * GFX_CHUNK_ROWS * 4 bytes of SRAM. Override
+ * with -DGFX_CHUNK_ROWS=n; it does not buy much CPU back either (an async
+ * frame measured 2.49 / 2.33 / 2.29 ms of CPU at 2 / 4 / 8 rows, with
+ * CHGFX_ISR_IN_SRAM).
  *
  * 2 rows = 512 B per buffer, 1 KB total. Measured against the obvious
  * 4 rows on real hardware: gfx_flush went 11051 -> 11143 us, about
@@ -83,7 +88,9 @@
  * a kilobyte, and on a part with 20 KB total a kilobyte is 5% of all
  * the memory there is - the right way round for this chip. Raise it if
  * you have RAM to spare and want the last percent. */
+#ifndef GFX_CHUNK_ROWS
 #define GFX_CHUNK_ROWS   2
+#endif
 #define GFX_CHUNK_BYTES  (GFX_W * GFX_CHUNK_ROWS * 2)   /* worst case, 16 bpp */
 
 /* ------------------------------------------------------------------ */
@@ -173,9 +180,24 @@ void gfx_setInverted(bool on);
  * actually changing. Defaults to the fast setting. */
 void gfx_setPanelFrameRate(uint8_t rtna, uint8_t fpa, uint8_t bpa);
 
-/* Palette. Rebuilds the expansion LUT, so call it outside the hot loop. */
+/* Palette. Changes are STAGED: they take effect when the next flush
+ * starts, never part-way through one in flight, so these are safe to call
+ * at any time - including between gfx_flushAsync() and gfx_wait(). Every
+ * frame is re-sent through the palette, so animating it (cycling a slot,
+ * pulsing a highlight, a fade) costs a 256-entry table rebuild per frame
+ * and no drawing at all. */
 void gfx_setPalette(const uint16_t *rgb565, uint8_t count);
 void gfx_setPaletteEntry(uint8_t index, uint16_t rgb565);
+
+/* Fade every colour toward rgb565 (black by default) by amount/255:
+ * 0 = the palette as set, 255 = solid rgb565. Applied while the LUT is
+ * built, so gfx_pal[] keeps the true colours and gfx_nearest() still
+ * matches against them. Staged like the palette. */
+void gfx_setFade(uint8_t amount, uint16_t rgb565 = 0x0000);
+uint8_t gfx_fade(void);
+
+/* The colour index i actually reaches the panel as, fade included. */
+uint16_t gfx_paletteOut(uint8_t index);
 static inline uint16_t gfx_rgb(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
@@ -187,6 +209,46 @@ void gfx_flush(void);       /* convert + DMA the whole frame, blocking  */
 void gfx_flushAsync(void);  /* same, but returns after the first chunk  */
 bool gfx_busy(void);
 void gfx_wait(void);
+
+/*
+ * WHAT A FLUSH COSTS THE CPU. The wire time is fixed (11.1 ms a full
+ * frame at 16 bpp, 8.4 ms at 12 bpp) and an async flush hands it to the
+ * DMA. The pixel conversion still runs on the CPU, in the DMA interrupt,
+ * one chunk at a time, and the DMA shares the bus: measured on the board,
+ * an async full frame costs the main loop 2.5-3.2 ms of CPU (by -O2/-Os
+ * and 12/16 bpp). At 60 fps that is a sixth of the CPU, taken from
+ * whatever the main loop is doing - an AI search, for example. A partial
+ * flush costs in proportion to its area. (Before 1.3, at the board's
+ * default -Os, the converters were silently compiled into flash and the
+ * same flush cost 5.1 ms.) -DCHGFX_ISR_IN_SRAM trims it by 4-9% for
+ * ~330 bytes of SRAM.
+ *
+ * The cheapest frame is the one you do not draw: if nothing on screen
+ * changed, flush the buffer you already have. A palette animation still
+ * moves (the palette is applied during the flush), and the frame costs a
+ * flush and no drawing.
+ */
+
+/*
+ * Flush progress - "racing the beam". The flush converts the framebuffer
+ * top to bottom, and a row it has converted is never read again, so it
+ * is free to draw into while the rest of the frame is still going out.
+ *
+ *   gfx_flushRow() - the first row the flush in flight may still read.
+ *                    Rows above it are free. GFX_H when idle.
+ *   gfx_waitRow(y) - wait until rows 0..y-1 are free. gfx_waitRow(GFX_H)
+ *                    is gfx_wait().
+ *
+ * Useful when the next frame is drawn top to bottom: wait for the top
+ * band, draw it, wait for the next. A clip rectangle keeps the drawing
+ * honest:
+ *
+ *     gfx_waitRow(64);  gfx_setClip(0, 0, 128, 64);   drawTopHalf();
+ *     gfx_wait();       gfx_setClip(0, 64, 128, 64);  drawBottomHalf();
+ *     gfx_resetClip();  gfx_flushAsync();
+ */
+int  gfx_flushRow(void);
+void gfx_waitRow(int y);
 
 /* ------------------------------------------------------------------ */
 /* Direct streaming - bypass the framebuffer entirely                  */
@@ -250,6 +312,19 @@ void gfx_flushRectAsync(int x, int y, int w, int h);
 /* ------------------------------------------------------------------ */
 /* Framebuffer drawing (all clipped, all operate on the 4 bpp buffer)  */
 /* ------------------------------------------------------------------ */
+/* Clip rectangle. Every call that paints pixels - fills, lines, shapes,
+ * text, sprites, gfx_clear() - stays inside it. It is intersected with
+ * the screen; an empty one (w or h <= 0) stops all drawing. Defaults to
+ * the whole screen. gfx_getPixel(), gfx_scroll() and the flush ignore it.
+ * Changing it costs nothing, so set it around a panel or a HUD and put it
+ * back:
+ *
+ *     gfx_setClip(0, 10, 128, 118);   drawBoard();   gfx_resetClip();
+ */
+void gfx_setClip(int x, int y, int w, int h);
+void gfx_resetClip(void);
+void gfx_getClip(int *x, int *y, int *w, int *h);
+
 void gfx_clear(uint8_t c);
 void gfx_pixel(int x, int y, uint8_t c);
 uint8_t gfx_getPixel(int x, int y);
@@ -266,6 +341,85 @@ void gfx_fillCircle(int cx, int cy, int r, uint8_t c);
  * byte. transparent = colour index skipped, or -1 for an opaque copy
  * (the opaque even-x case runs at memcpy speed). */
 void gfx_blit(const uint8_t *spr, int x, int y, int w, int h, int transparent);
+
+/* ------------------------------------------------------------------ */
+/* Shapes                                                              */
+/* ------------------------------------------------------------------ */
+/* Rounded rectangles. Corners are pixel-art arcs, not chamfers; r is
+ * clamped to half the shorter side, and r = 0 is a plain rectangle. */
+void gfx_roundRect(int x, int y, int w, int h, int r, uint8_t c);
+void gfx_fillRoundRect(int x, int y, int w, int h, int r, uint8_t c);
+
+/* Axis-aligned ellipse centred on (cx, cy), 2*rx+1 by 2*ry+1 pixels.
+ * Integer only, no square roots. */
+void gfx_ellipse(int cx, int cy, int rx, int ry, uint8_t c);
+void gfx_fillEllipse(int cx, int cy, int rx, int ry, uint8_t c);
+
+/* 50% checkerboard of colour c over a rectangle; the pixels in between
+ * are left alone. phase 0 paints pixels where x + y is even, phase 1
+ * where it is odd. Darkened backdrops behind menus, felt, shadows. */
+void gfx_dither(int x, int y, int w, int h, uint8_t c, uint8_t phase);
+
+/* Recolour a rectangle in place through a 16-entry table:
+ * pixel = remap[pixel]. Dimming, tinting, a hit flash on what is
+ * already drawn. */
+void gfx_remapRect(int x, int y, int w, int h, const uint8_t *remap);
+
+/* ------------------------------------------------------------------ */
+/* Span sprites (sprite4)                                              */
+/* ------------------------------------------------------------------ */
+/*
+ * The compact sprite format two CHGame titles arrived at independently.
+ * Each row is a list of runs of one colour, so the art is small and a
+ * run is a fill, not a pixel loop:
+ *
+ *     w, h, then per row:  n, then n bytes of  (len - 1) << 4 | colour
+ *
+ * Runs are 1..16 px. Colour 15 is transparent (a skip), and trailing
+ * transparency is left out. extras/sprite4.py packs a PNG.
+ *
+ * Every pixel is drawn through remap[colour] (nullptr = as is), so ONE
+ * image serves many looks: a team colour, a red damage flash, a white
+ * hit flash, a solid silhouette for an outline. With 16 colours,
+ * palette swapping is the natural way to get variety.
+ *
+ * scale is Q8 (256 = 1:1, 512 = double, 128 = half), nearest neighbour,
+ * about the top-left corner. 1:1 has its own fast path, so leave it at
+ * 256 unless you mean it.
+ */
+void gfx_sprite4(const uint8_t *spr, int x, int y,
+                 const uint8_t *remap = nullptr, int scale = 256);
+static inline int gfx_sprite4W(const uint8_t *spr) { return spr[0]; }
+static inline int gfx_sprite4H(const uint8_t *spr) { return spr[1]; }
+
+/* Rotated and scaled: the sprite's pixel (ax, ay) lands on screen at
+ * (px, py), turned by angle (256 = a full turn, clockwise on screen) and
+ * scaled by scale (Q8). The art is decoded into gfx_chunkScratch(), so
+ * it must fit in 1 KB at 4 bpp (32x64, 45x45) and this call waits for any
+ * flush in flight first. Per pixel, so costlier than gfx_sprite4(). */
+void gfx_sprite4Rot(const uint8_t *spr, int ax, int ay, int px, int py,
+                    uint8_t angle, int scale = 256, const uint8_t *remap = nullptr);
+
+/* ------------------------------------------------------------------ */
+/* Row operations                                                      */
+/* ------------------------------------------------------------------ */
+/*
+ * Word copies in SRAM. newlib-nano's memmove/memcpy are byte loops in
+ * flash here: a screen shake built on memmove cost ~10 ms a frame.
+ *
+ * gfx_scroll moves the band of rows y..y+h-1 by dx pixels right and dy
+ * rows down (negative = left/up), inside the band. Pixels uncovered by
+ * the move are painted `fill`, or keep what they had with fill < 0. Odd
+ * dx is fine (nibble shifts). It works on whole rows and ignores the clip
+ * rectangle - it is a post-process: shake, scrolling backgrounds.
+ */
+void gfx_scroll(int y, int h, int dx, int dy, int fill = -1);
+
+/* Pixels [x0, x1) of a full-width row buffer (GFX_FB_STRIDE bytes, packed
+ * like the framebuffer) into framebuffer row y, clipped. Build a pattern
+ * row once, stamp it into many rows at word speed: tiled floors,
+ * checkerboards, gradients. */
+void gfx_copyRow(int y, const uint8_t *src, int x0, int x1);
 
 /* ------------------------------------------------------------------ */
 /* Text                                                                */
@@ -326,6 +480,28 @@ int gfx_textWidthScaled(const char *s, uint8_t scale);
 void gfx_textBounds(const char *s, int x, int y, uint8_t scale,
                     int *bx, int *by, int *bw, int *bh);
 
+/*
+ * Outlined, shadowed, gradient-filled text - titles and banners. Same
+ * font, origin and scale rules as gfx_textScaled().
+ *
+ *   fill     colour of the letters
+ *   outline  a 1 px ring around them (all 8 directions), or -1
+ *   shadow   the outlined shape again, 1 px down-right, underneath, or -1
+ *   ramp     optional: a fill colour per pixel row of the text, top to
+ *            bottom (as many entries as the text is tall), replacing fill
+ *   dy       optional: a vertical offset per character, for wavy text
+ *
+ * Drawing the glyphs nine times over would cost ~9x a plain print. This
+ * renders the text once into a 1 bpp mask in gfx_chunkScratch(), grows
+ * the outline out of it with word-wide ORs and paints each row as spans.
+ * The mask - the text's ink box plus a 1 px margin - must fit in 1 KB:
+ * text up to 126x62 px, or 254x30. Returns false and draws nothing if it
+ * does not. Waits for any flush in flight first.
+ */
+bool gfx_textFx(int x, int y, const char *s, uint8_t scale, uint8_t fill,
+                int outline = -1, int shadow = -1,
+                const uint8_t *ramp = nullptr, const int8_t *dy = nullptr);
+
 /* ------------------------------------------------------------------ */
 /* Direct-to-panel paths (bypass the framebuffer entirely)             */
 /* ------------------------------------------------------------------ */
@@ -367,7 +543,11 @@ uint32_t gfx_convertRows_ram(uint8_t *dst, uint16_t row, uint16_t rows);
 uint32_t gfx_convertRows_flash(uint8_t *dst, uint16_t row, uint16_t rows);
 uint32_t gfx_convertSpan_ram(uint8_t *dst, const uint8_t *src, uint32_t srcBytes);
 
-/* A scratch buffer the benchmark can borrow (2 * GFX_CHUNK_BYTES). */
+/* 1 KB of scratch (2 * GFX_CHUNK_BYTES, word aligned): the flush's chunk
+ * buffers, idle from gfx_wait() until the next flush starts. Handy for
+ * decoding, masks, building a flash page - never across a flush.
+ * gfx_sprite4Rot() and gfx_textFx() use it, so it does not survive them
+ * either. */
 uint8_t *gfx_chunkScratch(void);
 
 /* Bytes the panel receives for a full frame in the current mode. */
@@ -407,6 +587,8 @@ public:
     /* Palette */
     void setPalette(const uint16_t *p, uint8_t n)    { gfx_setPalette(p, n); }
     void setPaletteEntry(uint8_t i, uint16_t c)      { gfx_setPaletteEntry(i, c); }
+    void setFade(uint8_t amount, uint16_t rgb565 = 0) { gfx_setFade(amount, rgb565); }
+    uint8_t fade() const                             { return gfx_fade(); }
     uint8_t nearest(uint16_t rgb565) const           { return gfx_nearest(rgb565); }
     static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return gfx_rgb(r, g, b); }
 
@@ -418,6 +600,13 @@ public:
     void displayRectAsync(int x, int y, int w, int h){ gfx_flushRectAsync(x, y, w, h); }
     bool busy() const                                { return gfx_busy(); }
     void wait()                                      { gfx_wait(); }
+    int  flushRow() const                            { return gfx_flushRow(); }
+    void waitRow(int y)                              { gfx_waitRow(y); }
+
+    /* Clip */
+    void setClip(int x, int y, int w, int h)               { gfx_setClip(x, y, w, h); }
+    void resetClip()                                       { gfx_resetClip(); }
+    void getClip(int *x, int *y, int *w, int *h) const     { gfx_getClip(x, y, w, h); }
 
     /* Draw */
     void clear(uint8_t c)                                  { gfx_clear(c); }
@@ -432,12 +621,28 @@ public:
     void fillCircle(int cx, int cy, int r, uint8_t c)      { gfx_fillCircle(cx, cy, r, c); }
     void drawSprite(const uint8_t *s, int x, int y, int w, int h, int transparent = -1)
                                                            { gfx_blit(s, x, y, w, h, transparent); }
+    void drawRoundRect(int x, int y, int w, int h, int r, uint8_t c) { gfx_roundRect(x, y, w, h, r, c); }
+    void fillRoundRect(int x, int y, int w, int h, int r, uint8_t c) { gfx_fillRoundRect(x, y, w, h, r, c); }
+    void drawEllipse(int cx, int cy, int rx, int ry, uint8_t c)      { gfx_ellipse(cx, cy, rx, ry, c); }
+    void fillEllipse(int cx, int cy, int rx, int ry, uint8_t c)      { gfx_fillEllipse(cx, cy, rx, ry, c); }
+    void dither(int x, int y, int w, int h, uint8_t c, uint8_t phase = 0) { gfx_dither(x, y, w, h, c, phase); }
+    void remapRect(int x, int y, int w, int h, const uint8_t *remap) { gfx_remapRect(x, y, w, h, remap); }
+    void drawSprite4(const uint8_t *s, int x, int y, const uint8_t *remap = nullptr, int scale = 256)
+                                                           { gfx_sprite4(s, x, y, remap, scale); }
+    void drawSprite4Rot(const uint8_t *s, int ax, int ay, int px, int py, uint8_t angle,
+                        int scale = 256, const uint8_t *remap = nullptr)
+                                                           { gfx_sprite4Rot(s, ax, ay, px, py, angle, scale, remap); }
+    void scroll(int y, int h, int dx, int dy, int fill = -1) { gfx_scroll(y, h, dx, dy, fill); }
+    void copyRow(int y, const uint8_t *src, int x0, int x1)  { gfx_copyRow(y, src, x0, x1); }
     void drawChar(int x, int y, char ch, uint8_t c)        { gfx_char(x, y, ch, c); }
     void drawChar(int x, int y, char ch, uint8_t c, uint8_t scale)
                                                            { gfx_charScaled(x, y, ch, c, scale); }
     void print(int x, int y, const char *s, uint8_t c)     { gfx_text(x, y, s, c); }
     void print(int x, int y, const char *s, uint8_t c, uint8_t scale)
                                                            { gfx_textScaled(x, y, s, c, scale); }
+    bool printFx(int x, int y, const char *s, uint8_t scale, uint8_t fill, int outline = -1,
+                 int shadow = -1, const uint8_t *ramp = nullptr, const int8_t *dy = nullptr)
+                                                           { return gfx_textFx(x, y, s, scale, fill, outline, shadow, ramp, dy); }
 
     /* Fonts. setFont(nullptr) returns to the built-in 5x7. Note that a
      * custom font takes y as the baseline - see the block above

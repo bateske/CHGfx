@@ -46,6 +46,7 @@ after the bootloader.
 | Font | Glyphs | Line | Baseline | Digit | Flash | Notes |
 |---|---:|---:|---:|---:|---:|---|
 | built-in 5×7 | 0x20–0x7E | 8 | 0 | 6 | **475 B** | Always there, no `#include` |
+| `CHGfx_Tiny3x5` | 0x20–0x7E | 7 | 5 | 4 | **857 B** | 3×5 pixels, 32 characters a line: HUDs, plates |
 | `CHGfx_Mono11` | 0x20–0x7E | 14 | 9 | 7 | **1233 B** | Fixed pitch, 18 columns across |
 | `CHGfx_Sans12` | 0x20–0x7E | 15 | 10 | 8 | **1344 B** | Proportional body text |
 | `CHGfx_SansBold12` | 0x20–0x7E | 15 | 10 | 8 | **1444 B** | Same size, reads on busy art |
@@ -63,8 +64,24 @@ Characters outside a font's range are drawn as `?`, or dropped when the
 font has no `?` — a space is *not* in `CHGfx_Digits24`, so pad with `0`
 or leave gaps with cursor arithmetic.
 
-All five are rasterized from DejaVu Sans, which is freely redistributable;
-the notice is in [LICENSE](LICENSE).
+The five larger fonts are rasterized from DejaVu Sans, which is freely
+redistributable; the notice is in [LICENSE](LICENSE).
+
+`CHGfx_Tiny3x5` is the other way round: a pixel font drawn by hand, Press
+Play On Tape's 3×5 from "Blackjack" for the Arduboy (Apache License 2.0,
+see [LICENSE.Apache-2.0](LICENSE.Apache-2.0)), completed here to the whole
+printable ASCII range. Capitals are 5 px tall and lowercase 4, with a
+one-pixel descender; every character advances 4 px, so text measures
+`4 × length - 1` pixels of ink. It is sharp at scale 2 and 3 as well —
+6×10 menu text, or banner lettering with `printFx()`:
+
+```cpp
+#include <fonts/CHGfx_Tiny3x5.h>
+
+Gfx.setFont(&CHGfx_Tiny3x5);
+Gfx.print(2, 2 + Gfx.fontBaseline(), "SCORE 001234", WHITE);
+Gfx.print(10, 60, "PRESS A", YELLOW, 2);
+```
 
 ## Metrics
 
